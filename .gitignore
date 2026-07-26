@@ -1,0 +1,27 @@
+# Claude Code local settings
+.claude/settings.local.json
+
+# QLever index and vocabulary files
+wikidata-truthy/*.nt.bz2
+wikidata-truthy/*.index.*
+wikidata-truthy/*.internal.index.*
+wikidata-truthy/*.vocabulary.*
+wikidata-truthy/*.meta-data.json
+wikidata-truthy/*.settings.json
+wikidata-truthy/*-log.txt
+wikidata-truthy/*.ops
+wikidata-truthy/*.ops.meta
+wikidata-truthy/*.patterns
+
+# Property-search service: venv + generated embedding index (rebuild via build_index.py)
+wikidata-property-search/.venv/
+wikidata-property-search/index/
+
+# Pattern for any future dataset directories
+*/*.nt.bz2
+*/*.index.*
+*/*.internal.index.*
+*/*.vocabulary.*
+*/*.meta-data.json
+*/*.settings.json
+*/*-log.txt

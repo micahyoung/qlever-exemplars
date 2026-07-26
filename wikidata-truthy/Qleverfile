@@ -1,0 +1,34 @@
+# Qleverfile for Wikidata Truthy (only statements ranked "truthy")
+#
+# qlever get-data  # downloads the truthy dump
+# qlever index     # builds the index
+# qlever start     # starts the server
+
+[DEFAULT]
+NAME = wikidata-truthy
+
+[data]
+GET_DATA_URL = https://dumps.wikimedia.org/wikidatawiki/entities
+GET_DATA_CMD = curl -LRC - -O ${GET_DATA_URL}/latest-truthy.nt.bz2 2>&1 | tee wikidata-truthy.download-log.txt
+DATE_WIKIDATA = $$(date -r latest-truthy.nt.bz2 +%d.%m.%Y || echo "NO_DATE")
+DESCRIPTION   = Wikidata truthy statements (ranked "truthy" only), from ${GET_DATA_URL} (latest-truthy.nt.bz2), version ${DATE_WIKIDATA}
+
+[index]
+INPUT_FILES    = latest-truthy.nt.bz2
+MULTI_INPUT_JSON = { "cmd": "pbzip2 -dc latest-truthy.nt.bz2", "format": "nt", "parallel": "true" }
+SETTINGS_JSON  = { "languages-internal": [], "prefixes-external": [""], "locale": { "language": "en", "country": "US", "ignore-punctuation": true }, "ascii-prefixes-only": true, "num-triples-per-batch": 5000000 }
+STXXL_MEMORY   = 10G
+
+[server]
+PORT                        = 7001
+ACCESS_TOKEN                = wikidata-truthy
+MEMORY_FOR_QUERIES          = 20G
+CACHE_MAX_SIZE              = 15G
+CACHE_MAX_SIZE_SINGLE_ENTRY = 5G
+TIMEOUT                     = 600s
+
+[runtime]
+SYSTEM = native
+
+[ui]
+UI_CONFIG = wikidata
