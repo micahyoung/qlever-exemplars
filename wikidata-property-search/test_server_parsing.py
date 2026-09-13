@@ -321,3 +321,91 @@ def test_sparql_route_legacy_form_missing_phrase_returns_empty():
     assert resp.status_code == 200
     body = resp.get_json()
     assert body == {"head": {"vars": []}, "results": {"bindings": []}}
+
+
+# --- /sparql route: resolution failures bubble up as non-200 errors ----------
+#
+# A tier-3 failure or clean non-match must never come back as an HTTP 200
+# with empty/partial bindings: QLever caches any 200 SERVICE response
+# indefinitely (even an empty one), so a transient failure returned that
+# way would get stuck as a permanently-cached false "no match." A non-2xx
+# response is never cached and is retried fresh on the next identical
+# query -- see server.ResolutionError and its errorhandler.
+
+def test_sparql_route_legacy_form_tier3_timeout_returns_non_200(monkeypatch):
+    monkeypatch.setattr(
+        server.resolver, "resolve_property_tier3",
+        lambda *a, **k: (_ for _ in ()).throw(TimeoutError("llm timed out")),
+    )
+    client = server.app.test_client()
+    query = """
+    PREFIX wikibase: <http://wikiba.se/ontology#>
+    PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+    PREFIX bd: <http://www.bigdata.com/rdf#>
+    SELECT * WHERE {
+      SERVICE <http://localhost:7002/sparql> {
+        bd:serviceParam mwapi:search "zzz_definitely_not_a_real_phrase" .
+        bd:serviceParam mwapi:type "property" .
+        ?prop wikibase:apiOutput mwapi:directProperty .
+      }
+    }
+    """
+    resp = client.get("/sparql", query_string={"query": query})
+    assert resp.status_code != 200
+
+
+def test_sparql_route_legacy_form_tier3_clean_non_match_returns_non_200(monkeypatch):
+    monkeypatch.setattr(server.resolver, "resolve_property_tier3", lambda *a, **k: None)
+    client = server.app.test_client()
+    query = """
+    PREFIX wikibase: <http://wikiba.se/ontology#>
+    PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+    PREFIX bd: <http://www.bigdata.com/rdf#>
+    SELECT * WHERE {
+      SERVICE <http://localhost:7002/sparql> {
+        bd:serviceParam mwapi:search "zzz_definitely_not_a_real_phrase" .
+        bd:serviceParam mwapi:type "property" .
+        ?prop wikibase:apiOutput mwapi:directProperty .
+      }
+    }
+    """
+    resp = client.get("/sparql", query_string={"query": query})
+    assert resp.status_code != 200
+
+
+def test_sparql_route_batch_form_fails_atomically_on_one_bad_lookup(monkeypatch):
+    """"date of birth" resolves via tier 1 with zero network calls; the
+    second phrase is forced to fail. The whole call must fail -- not come
+    back as a 200 with "birthProp" bound and the other variable missing."""
+    monkeypatch.setattr(server.resolver, "resolve_property_tier3", lambda *a, **k: None)
+    client = server.app.test_client()
+    query = """
+    PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+    SELECT * WHERE {
+      SERVICE <http://localhost:7002/sparql> {
+        [] mwapi:search "date of birth" ; mwapi:type "property" ; mwapi:bind ?birthProp .
+        [] mwapi:search "zzz_definitely_not_a_real_phrase" ; mwapi:type "property" ; mwapi:bind ?deathProp .
+      }
+    }
+    """
+    resp = client.get("/sparql", query_string={"query": query})
+    assert resp.status_code != 200
+
+
+def test_sparql_route_relation_form_clean_non_match_returns_non_200(monkeypatch):
+    monkeypatch.setattr(
+        server.resolver, "resolve_relation_tier3", lambda *a, **k: (None, None)
+    )
+    client = server.app.test_client()
+    query = """
+    PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+    SELECT * WHERE {
+      SERVICE <http://localhost:7002/sparql> {
+        [] mwapi:searchRelation "zzz_definitely_not_a_real_relation" ;
+           mwapi:bindProperty ?awardProp ;
+           mwapi:bindItem ?nobelPhysics .
+      }
+    }
+    """
+    resp = client.get("/sparql", query_string={"query": query})
+    assert resp.status_code != 200

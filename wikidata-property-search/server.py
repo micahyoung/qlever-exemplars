@@ -17,8 +17,14 @@ rdfs:label for items, which lets item resolution reach beyond the precomputed
 ~114k class universe to general named entities (e.g. "Marie Curie", "the Big
 Apple"). Tier 3 is best-effort (not guaranteed to resolve, and slower than
 tier 1); successful resolutions are persisted so repeat queries become
-instant tier-1 hits. If both tiers miss, the request returns a clean empty
-SPARQL result (no bindings) and logs a warning -- never a silent guess.
+instant tier-1 hits. If both tiers miss -- or tier 3 itself fails (LLM
+error, timeout, live-verification error) -- the request raises and returns
+a non-2xx response, which QLever propagates as a genuine SPARQL query
+failure rather than a silent empty result. This is deliberate: QLever's own
+result cache stores any HTTP-200 SERVICE response (even an empty one)
+indefinitely, so a transient failure returned as a "success" would get
+stuck cached as a false permanent non-match; a non-2xx response is never
+cached and is retried fresh on the next identical query.
 
 It does NOT implement general SPARQL. It recognizes a small vocabulary of
 request shapes within a `SERVICE { ... }` block, parsed as a real (if
@@ -67,6 +73,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, request, Response
 from rdflib import BNode, Graph, Namespace
+from werkzeug.exceptions import HTTPException
 
 import llm_client
 import qlever_client
@@ -86,9 +93,6 @@ from index_store import (
 PORT = int(os.environ.get("PORT", "7002"))
 MAX_LIMIT = 50
 DEFAULT_LIMIT = 10
-
-# --- tier-3 config ---------------------------------------------------------
-TIER3_ENABLED = os.environ.get("TIER3_ENABLED", "true").lower() == "true"
 
 ENTITY_PREFIX = "http://www.wikidata.org/entity/"
 DIRECT_PREFIX = "http://www.wikidata.org/prop/direct/"
@@ -145,6 +149,14 @@ LEARNED_RELATIONS = _load_learned_relations(LEARNED_RELATIONS_PATH)
 INDEX_LOCKS = {"property": threading.Lock(), "item": threading.Lock(), "relation": threading.Lock()}
 
 app = Flask(__name__)
+
+
+class ResolutionError(Exception):
+    """Raised whenever a phrase/relation cannot be resolved -- LLM error,
+    timeout, live-verification failure, or a clean non-match after
+    exhausting tier 3. Always surfaces as a non-2xx HTTP response so QLever
+    propagates it as a genuine SPARQL query failure and never caches it
+    (QLever's result cache only stores HTTP-200 SERVICE responses)."""
 
 
 # --- tier-3 persistence (real implementations, injected into resolver.py) -----
@@ -463,57 +475,53 @@ def get_query():
         or request.get_data(as_text=True)
 
 
-def _maybe_resolve_tier3(phrase, ptype, bundle):
-    """Tier-1->tier-3 routing decision. Fires whenever tier 1 missed.
-    Resolution failures (bad LLM output, timeouts, live-QLever errors) are
-    caught here and treated as a tier-3 miss -- the caller returns an empty
-    (not error) result, response stays 200, never 500."""
-    if not TIER3_ENABLED:
-        return None
-    if not resolver.should_attempt_tier3(phrase, bundle):
-        return None
-
-    try:
-        if ptype == "property":
-            return resolver.resolve_property_tier3(
-                phrase,
-                bundle,
-                llm_client.generate_property_permutations,
-                _persist_property_alias,
-            )
-        if ptype == "item":
-            return resolver.resolve_item_tier3(
-                phrase,
-                llm_client.generate_item_permutations,
-                qlever_client.resolve_entity_uri,
-                qlever_client.fetch_entity_for_index,
-                _persist_item_row,
-            )
-    except Exception as exc:  # noqa: BLE001 - resolution failure -> clean miss
-        print(f"WARNING: tier-3 resolution failed for {phrase!r} ({ptype}): {exc}", flush=True)
-        return None
-    return None
+def _resolve_tier3(phrase, ptype, bundle):
+    """Tier-3 LLM-backed resolution. Raises ResolutionError on any failure
+    to resolve. LLM/timeout/live-verification exceptions from resolver.py
+    propagate as-is (its contract already raises on real failures and
+    returns None only for a clean non-match); a None return is turned into
+    a ResolutionError here so every failure mode looks the same to the
+    caller and to the SPARQL client."""
+    if ptype == "property":
+        hit = resolver.resolve_property_tier3(
+            phrase,
+            bundle,
+            llm_client.generate_property_permutations,
+            _persist_property_alias,
+        )
+    elif ptype == "item":
+        hit = resolver.resolve_item_tier3(
+            phrase,
+            llm_client.generate_item_permutations,
+            qlever_client.resolve_entity_uri,
+            qlever_client.fetch_entity_for_index,
+            _persist_item_row,
+        )
+    else:
+        hit = None
+    if hit is None:
+        raise ResolutionError(f"no resolution for {phrase!r} ({ptype})")
+    return hit
 
 
 def _resolve_one(phrase, ptype):
     """Tier-1-then-tier-3 resolution of a single phrase to its best (only)
-    hit, or None. Used by the legacy form's single-hit paths and by each
-    entry of a batched-independent-properties request."""
+    hit. Used by the legacy form's single-hit paths and by each entry of a
+    batched-independent-properties request. Raises ResolutionError if
+    neither tier resolves it."""
     if ptype not in INDEXES or INDEXES[ptype] is None:
-        return None
+        raise ResolutionError(f'unsupported or unloaded mwapi:type "{ptype}"')
     bundle = INDEXES[ptype]
     hits = search_lexical(phrase, 1, bundle, ptype=ptype)
     if hits:
         return hits[0]
-    hit = _maybe_resolve_tier3(phrase, ptype, bundle)
-    if hit is None:
-        print(f"WARNING: no resolution for {phrase!r} ({ptype})", flush=True)
-    return hit
+    return _resolve_tier3(phrase, ptype, bundle)
 
 
 def _resolve_relation(phrase):
     """Tier-1 relation-phrase-cache lookup, else tier-3 joint resolution.
-    Returns (property_meta, item_meta), either possibly None."""
+    Returns (property_meta, item_meta) on success; raises ResolutionError
+    otherwise."""
     cached = LEARNED_RELATIONS.get(normalize(phrase))
     if cached:
         prop_meta = next((m for m in PROPERTY_INDEX.meta if m.get("pid") == cached["pid"]), None)
@@ -523,37 +531,33 @@ def _resolve_relation(phrase):
         if prop_meta and item_meta:
             return prop_meta, item_meta
 
-    if not TIER3_ENABLED or ITEM_INDEX is None:
-        print(f"WARNING: no relation resolution for {phrase!r}", flush=True)
-        return None, None
+    if ITEM_INDEX is None:
+        raise ResolutionError("item index is not loaded; cannot resolve relations")
 
-    try:
-        prop_meta, item_meta = resolver.resolve_relation_tier3(
-            phrase,
-            llm_client.generate_relation_pairs,
-            PROPERTY_INDEX,
-            ITEM_INDEX,
-            qlever_client.resolve_entity_uri,
-            qlever_client.fetch_entity_for_index,
-            qlever_client.triple_exists,
-            _persist_property_alias,
-            _persist_item_row,
-            _persist_relation_cache,
-        )
-    except Exception as exc:  # noqa: BLE001 - resolution failure -> clean miss
-        print(f"WARNING: relation tier-3 resolution failed for {phrase!r}: {exc}", flush=True)
-        return None, None
-
+    prop_meta, item_meta = resolver.resolve_relation_tier3(
+        phrase,
+        llm_client.generate_relation_pairs,
+        PROPERTY_INDEX,
+        ITEM_INDEX,
+        qlever_client.resolve_entity_uri,
+        qlever_client.fetch_entity_for_index,
+        qlever_client.triple_exists,
+        _persist_property_alias,
+        _persist_item_row,
+        _persist_relation_cache,
+    )
     if prop_meta is None or item_meta is None:
-        print(f"WARNING: no relation resolution for {phrase!r}", flush=True)
+        raise ResolutionError(f"no relation resolution for {phrase!r}")
     return prop_meta, item_meta
 
 
 def build_batched_results(parsed):
     """Resolve every batch/relation request in `parsed` into a single
-    merged row (each request contributes at most one binding per its
-    output var(s); a request that fails to resolve simply leaves its var(s)
-    unbound in the row, matching the legacy form's existing miss behavior).
+    merged row. Atomic: if any single sub-lookup fails to resolve, it
+    raises ResolutionError (propagated to the caller) and the whole SERVICE
+    call fails -- rather than silently leaving that variable unbound, which
+    would otherwise risk an unconstrained-predicate/object scan downstream
+    once the resolved-but-partial row feeds into the composed query.
 
     `head.vars` mirrors QLever's exact expected variable list when known
     (parsed.expected_vars) rather than just the vars our own requests bind --
@@ -568,8 +572,6 @@ def build_batched_results(parsed):
     for req in parsed.batches:
         vars_.append(req["bind_var"])
         hit = _resolve_one(req["phrase"], req["type"])
-        if hit is None:
-            continue
         uri = hit["uri"]
         if req["type"] == "property":
             uri = uri.replace(ENTITY_PREFIX, DIRECT_PREFIX)
@@ -578,16 +580,13 @@ def build_batched_results(parsed):
     for req in parsed.relations:
         vars_.extend([req["property_var"], req["item_var"]])
         prop_hit, item_hit = _resolve_relation(req["phrase"])
-        if prop_hit is None or item_hit is None:
-            continue
         row[req["property_var"]] = {
             "type": "uri", "value": prop_hit["uri"].replace(ENTITY_PREFIX, DIRECT_PREFIX),
         }
         row[req["item_var"]] = {"type": "uri", "value": item_hit["uri"]}
 
-    bindings = [row] if row else []
     head_vars = parsed.expected_vars if parsed.expected_vars else vars_
-    return {"head": {"vars": head_vars}, "results": {"bindings": bindings}}
+    return {"head": {"vars": head_vars}, "results": {"bindings": [row]}}
 
 
 @app.route("/sparql", methods=["GET", "POST"])
@@ -625,11 +624,7 @@ def sparql():
 
     hits = search_lexical(legacy["phrase"], legacy["limit"], bundle, ptype=ptype)
     if not hits:
-        tier3_hit = _maybe_resolve_tier3(legacy["phrase"], ptype, bundle)
-        if tier3_hit is not None:
-            hits = [tier3_hit]
-        else:
-            print(f"WARNING: no resolution for {legacy['phrase']!r} ({ptype})", flush=True)
+        hits = [_resolve_tier3(legacy["phrase"], ptype, bundle)]
 
     out = build_results(legacy, hits)
     # Mirror QLever's exact expected variable set when known (see
@@ -638,6 +633,20 @@ def sparql():
     if parsed.expected_vars:
         out["head"]["vars"] = parsed.expected_vars
     return Response(json.dumps(out), content_type="application/sparql-results+json")
+
+
+@app.errorhandler(Exception)
+def handle_resolution_failure(exc):
+    """Turn any propagated resolution failure (ResolutionError, or a stray
+    LLM/live-QLever exception like a timeout) into a uniform non-2xx
+    response, while leaving Flask's own routing errors (404, 405, ...)
+    untouched. QLever never caches a non-2xx SERVICE response, so this is
+    what lets a retry actually re-attempt resolution instead of replaying a
+    stale cached "no match" from a transient failure."""
+    if isinstance(exc, HTTPException):
+        return exc
+    print(f"WARNING: resolution failed: {exc}", flush=True)
+    return Response(str(exc), status=502)
 
 
 @app.route("/", methods=["GET"])
