@@ -1,0 +1,322 @@
+@prefix unit:  <https://w3id.org/OWLunit/ontology/> .
+@prefix ex:    <https://example.org/qlever/wikidata-truthy/cq/> .
+@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:   <http://www.w3.org/2002/07/owl#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+
+#################################################################
+# Ontology / dataset under test
+#################################################################
+
+ex:WikidataTruthyDataset a owl:Ontology ;
+    rdfs:label "Wikidata truthy (QLever local endpoint)" .
+
+#################################################################
+# CQ1 — Entity attribute lookup
+#################################################################
+
+ex:CQ1 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ1 - Entity attribute lookup" ;
+    unit:testsOntology ex:WikidataTruthyDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "When was Marie Curie born, and what was her date of death?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+
+SELECT ?item ?label ?birth ?death WHERE {
+  { ?item rdfs:label "Marie Curie"@en }
+  UNION
+  { ?item rdfs:label "Marie Sklodowska-Curie"@en }
+  ?item wdt:P31 wd:Q5 ;
+        wdt:P569 ?birth ;
+        rdfs:label ?label .
+  OPTIONAL { ?item wdt:P570 ?death }
+  FILTER(LANG(?label) = "en")
+}
+""" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wikibase: <http://wikiba.se/ontology#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+PREFIX bd: <http://www.bigdata.com/rdf#>
+
+SELECT ?item ?label ?birth ?death WHERE {
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "instance of" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?instanceOfProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "date of birth" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?birthProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "date of death" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?deathProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "human" .
+    bd:serviceParam mwapi:type "item" .
+    bd:serviceParam wikibase:limit "1" .
+    ?humanItem wikibase:apiOutputItem mwapi:item .
+  }
+  { ?item rdfs:label "Marie Curie"@en }
+  UNION
+  { ?item rdfs:label "Marie Sklodowska-Curie"@en }
+  ?item ?instanceOfProp ?humanItem ;
+        ?birthProp ?birth ;
+        rdfs:label ?label .
+  OPTIONAL { ?item ?deathProp ?death }
+  FILTER(LANG(?label) = "en")
+}
+""" .
+
+#################################################################
+# CQ2 — Relationship / hierarchy traversal
+#################################################################
+
+ex:CQ2 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ2 - Hierarchy traversal" ;
+    unit:testsOntology ex:WikidataTruthyDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "What entities fall under the administrative/locational hierarchy of Gweru, Zimbabwe?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+
+SELECT ?item ?label WHERE {
+  ?item wdt:P131+ wd:Q399316 .
+  ?item rdfs:label ?label . FILTER(LANG(?label)="en")
+} LIMIT 20
+""" .
+
+#################################################################
+# CQ3 — Multi-hop join
+#################################################################
+
+ex:CQ3 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ3 - Multi-hop join" ;
+    unit:testsOntology ex:WikidataTruthyDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "Which cities in Germany have a population over 500,000 and were founded before the year 1200?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT DISTINCT ?city ?label ?pop ?inception WHERE {
+  ?city wdt:P17 wd:Q183 .
+  ?city wdt:P31/wdt:P279* wd:Q515 .
+  ?city wdt:P1082 ?pop .
+  ?city wdt:P571 ?inception .
+  FILTER(?pop > 500000)
+  FILTER(?inception < "1200-01-01T00:00:00"^^xsd:dateTime)
+  ?city rdfs:label ?label . FILTER(LANG(?label)="en")
+} ORDER BY ?inception
+""" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX wikibase: <http://wikiba.se/ontology#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+PREFIX bd: <http://www.bigdata.com/rdf#>
+
+SELECT DISTINCT ?city ?label ?pop ?inception WHERE {
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "country" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?countryProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "instance of" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?instanceOfProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "population" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?popProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "inception" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?inceptionProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "city" .
+    bd:serviceParam mwapi:type "item" .
+    bd:serviceParam wikibase:limit "1" .
+    ?cityClass wikibase:apiOutputItem mwapi:item .
+  }
+  ?city ?countryProp wd:Q183 .
+  ?city ?instanceOfProp ?cls .
+  ?cls wdt:P279* ?cityClass .
+  ?city ?popProp ?pop .
+  ?city ?inceptionProp ?inception .
+  FILTER(?pop > 500000)
+  FILTER(?inception < "1200-01-01T00:00:00"^^xsd:dateTime)
+  ?city rdfs:label ?label . FILTER(LANG(?label)="en")
+} ORDER BY ?inception
+""" .
+
+#################################################################
+# CQ4 — Aggregation / ranking
+#################################################################
+
+ex:CQ4 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ4 - Aggregation and ranking" ;
+    unit:testsOntology ex:WikidataTruthyDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "Which countries have produced the most Nobel Prize laureates in Physics, ranked from most to least?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+
+SELECT ?countryLabel (COUNT(DISTINCT ?person) AS ?count) WHERE {
+  ?person wdt:P166 wd:Q38104 .
+  ?person wdt:P27 ?country .
+  ?country rdfs:label ?countryLabel . FILTER(LANG(?countryLabel)="en")
+} GROUP BY ?countryLabel ORDER BY DESC(?count) LIMIT 10
+""" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wikibase: <http://wikiba.se/ontology#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+PREFIX bd: <http://www.bigdata.com/rdf#>
+
+SELECT ?countryLabel (COUNT(DISTINCT ?person) AS ?count) WHERE {
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "award received" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?awardProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "country of citizenship" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?citizenshipProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "Nobel Prize in Physics" .
+    bd:serviceParam mwapi:type "item" .
+    bd:serviceParam wikibase:limit "1" .
+    ?nobelPhysics wikibase:apiOutputItem mwapi:item .
+  }
+  ?person ?awardProp ?nobelPhysics .
+  ?person ?citizenshipProp ?country .
+  ?country rdfs:label ?countryLabel . FILTER(LANG(?countryLabel)="en")
+} GROUP BY ?countryLabel ORDER BY DESC(?count) LIMIT 10
+""" .
+
+#################################################################
+# CQ5 — Disambiguation via type/context constraints
+#################################################################
+
+ex:CQ5 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ5 - Disambiguation via context constraint" ;
+    unit:testsOntology ex:WikidataTruthyDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "What is the population of Springfield, Illinois?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+
+SELECT DISTINCT ?item ?label ?pop WHERE {
+  ?item rdfs:label "Springfield"@en .
+  ?item wdt:P131* wd:Q1204 .
+  ?item wdt:P1082 ?pop .
+  BIND("Springfield"@en AS ?label)
+}
+""" .
+
+#################################################################
+# CQ6 — Cross-domain fact linking
+#################################################################
+
+ex:CQ6 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ6 - Cross-domain fact linking" ;
+    unit:testsOntology ex:WikidataTruthyDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "Which breweries headquartered in national capitals were founded before 1900?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT DISTINCT ?company ?label ?cityLabel ?inception WHERE {
+  ?city wdt:P1376 ?country .
+  ?company wdt:P159 ?city .
+  ?company wdt:P31 wd:Q131734 .
+  ?company wdt:P571 ?inception .
+  FILTER(?inception < "1900-01-01T00:00:00"^^xsd:dateTime)
+  ?company rdfs:label ?label . FILTER(LANG(?label)="en")
+  ?city rdfs:label ?cityLabel . FILTER(LANG(?cityLabel)="en")
+} ORDER BY ?inception LIMIT 15
+""" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX wikibase: <http://wikiba.se/ontology#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+PREFIX bd: <http://www.bigdata.com/rdf#>
+
+SELECT DISTINCT ?company ?label ?cityLabel ?inception WHERE {
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "capital of" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?capitalOfProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "headquarters location" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?hqProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "inception" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?inceptionProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "instance of" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?instanceOfProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "brewery" .
+    bd:serviceParam mwapi:type "item" .
+    bd:serviceParam wikibase:limit "1" .
+    ?breweryClass wikibase:apiOutputItem mwapi:item .
+  }
+  ?city ?capitalOfProp ?country .
+  ?company ?hqProp ?city .
+  ?company ?inceptionProp ?inception .
+  FILTER(?inception < "1900-01-01T00:00:00"^^xsd:dateTime)
+  ?company ?instanceOfProp ?breweryClass .
+  ?company rdfs:label ?label . FILTER(LANG(?label)="en")
+  ?city rdfs:label ?cityLabel . FILTER(LANG(?cityLabel)="en")
+} ORDER BY ?inception LIMIT 15
+""" .
