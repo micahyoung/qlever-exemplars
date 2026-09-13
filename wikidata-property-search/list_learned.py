@@ -7,6 +7,7 @@ resolution to go unnoticed until it was hit by accident).
 
 Usage: .venv/bin/python list_learned.py
 """
+import json
 import os
 
 from index_store import load_learned_aliases, load_learned_entities
@@ -14,7 +15,7 @@ from index_store import load_learned_aliases, load_learned_entities
 HERE = os.path.dirname(os.path.abspath(__file__))
 LEARNED_ALIASES_PATH = os.path.join(HERE, "index", "learned_aliases.json")
 LEARNED_ITEMS_META_PATH = os.path.join(HERE, "index_items", "learned_entities.json")
-LEARNED_ITEMS_VECTORS_PATH = os.path.join(HERE, "index_items", "learned_vectors.npy")
+LEARNED_RELATIONS_PATH = os.path.join(HERE, "learned_relations.json")
 
 
 def _print_table(rows, headers):
@@ -37,12 +38,25 @@ def main():
     else:
         print("(none)")
 
-    meta, _ = load_learned_entities(LEARNED_ITEMS_META_PATH, LEARNED_ITEMS_VECTORS_PATH)
+    meta = load_learned_entities(LEARNED_ITEMS_META_PATH)
     print(f"\n=== Learned items ({len(meta)}) ===")
     if meta:
         _print_table(
             [[m["qid"], m["label"], m["source_model"], m["added_at"]] for m in meta],
             ["qid", "label", "source_model", "added_at"],
+        )
+    else:
+        print("(none)")
+
+    relations = []
+    if os.path.exists(LEARNED_RELATIONS_PATH):
+        with open(LEARNED_RELATIONS_PATH) as f:
+            relations = json.load(f)
+    print(f"\n=== Learned relation phrases ({len(relations)}) ===")
+    if relations:
+        _print_table(
+            [[r["phrase_norm"], r["pid"], r["qid"], r["source_model"], r["added_at"]] for r in relations],
+            ["phrase", "pid", "qid", "source_model", "added_at"],
         )
     else:
         print("(none)")

@@ -39,34 +39,30 @@ SELECT ?item ?label ?birth ?death WHERE {
 """ ;
     unit:hasSPARQLQueryUnitTest """
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-PREFIX wikibase: <http://wikiba.se/ontology#>
 PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
-PREFIX bd: <http://www.bigdata.com/rdf#>
 
 SELECT ?item ?label ?birth ?death WHERE {
+  # mwapi:searchRelation resolves a "?x is-P Q" pair jointly (here: item is
+  # an instance of "human") instead of two blind lookups -- see the SERVICE
+  # syntax reference in CLAUDE.md. Split into two calls, one per output
+  # variable, per that same reference (a single call binding both into one
+  # triple can defeat QLever's planner); the repeat call is cache-cheap.
   SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "instance of" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?instanceOfProp wikibase:apiOutput mwapi:directProperty .
+    [] mwapi:searchRelation "instance of human" ;
+       mwapi:bindProperty ?instanceOfProp ;
+       mwapi:bindItem ?humanItemA .
   }
   SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "date of birth" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?birthProp wikibase:apiOutput mwapi:directProperty .
+    [] mwapi:searchRelation "instance of human" ;
+       mwapi:bindProperty ?instanceOfPropB ;
+       mwapi:bindItem ?humanItem .
   }
+  # mwapi:bind batches unrelated phrases ("date of birth", "date of death")
+  # into one round trip -- no joint-context benefit needed here, just fewer
+  # requests.
   SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "date of death" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?deathProp wikibase:apiOutput mwapi:directProperty .
-  }
-  SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "human" .
-    bd:serviceParam mwapi:type "item" .
-    bd:serviceParam wikibase:limit "1" .
-    ?humanItem wikibase:apiOutputItem mwapi:item .
+    [] mwapi:search "date of birth" ; mwapi:type "property" ; mwapi:bind ?birthProp .
+    [] mwapi:search "date of death" ; mwapi:type "property" ; mwapi:bind ?deathProp .
   }
   { ?item rdfs:label "Marie Curie"@en }
   UNION
@@ -133,40 +129,19 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX wdt: <http://www.wikidata.org/prop/direct/>
 PREFIX wd: <http://www.wikidata.org/entity/>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-PREFIX wikibase: <http://wikiba.se/ontology#>
 PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
-PREFIX bd: <http://www.bigdata.com/rdf#>
 
 SELECT DISTINCT ?city ?label ?pop ?inception WHERE {
+  # mwapi:bind for all five phrases -- NOT mwapi:searchRelation for
+  # "instance of"/"city", because they're not directly related here:
+  # ?instanceOfProp's object is ?cls, joined to ?cityClass through a
+  # wdt:P279* subclass hop, not the same triple.
   SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "country" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?countryProp wikibase:apiOutput mwapi:directProperty .
-  }
-  SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "instance of" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?instanceOfProp wikibase:apiOutput mwapi:directProperty .
-  }
-  SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "population" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?popProp wikibase:apiOutput mwapi:directProperty .
-  }
-  SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "inception" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?inceptionProp wikibase:apiOutput mwapi:directProperty .
-  }
-  SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "city" .
-    bd:serviceParam mwapi:type "item" .
-    bd:serviceParam wikibase:limit "1" .
-    ?cityClass wikibase:apiOutputItem mwapi:item .
+    [] mwapi:search "country" ; mwapi:type "property" ; mwapi:bind ?countryProp .
+    [] mwapi:search "instance of" ; mwapi:type "property" ; mwapi:bind ?instanceOfProp .
+    [] mwapi:search "population" ; mwapi:type "property" ; mwapi:bind ?popProp .
+    [] mwapi:search "inception" ; mwapi:type "property" ; mwapi:bind ?inceptionProp .
+    [] mwapi:search "city" ; mwapi:type "item" ; mwapi:bind ?cityClass .
   }
   ?city ?countryProp wd:Q183 .
   ?city ?instanceOfProp ?cls .
@@ -201,28 +176,24 @@ SELECT ?countryLabel (COUNT(DISTINCT ?person) AS ?count) WHERE {
 """ ;
     unit:hasSPARQLQueryUnitTest """
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-PREFIX wikibase: <http://wikiba.se/ontology#>
 PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
-PREFIX bd: <http://www.bigdata.com/rdf#>
 
 SELECT ?countryLabel (COUNT(DISTINCT ?person) AS ?count) WHERE {
+  # mwapi:searchRelation, split across two calls (see CQ1). Joint context
+  # here disambiguates "award received" from the individually-plausible
+  # "nominated for".
   SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "award received" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?awardProp wikibase:apiOutput mwapi:directProperty .
+    [] mwapi:searchRelation "received the Nobel Prize in Physics" ;
+       mwapi:bindProperty ?awardProp ;
+       mwapi:bindItem ?nobelPhysicsA .
   }
   SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "country of citizenship" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?citizenshipProp wikibase:apiOutput mwapi:directProperty .
+    [] mwapi:searchRelation "received the Nobel Prize in Physics" ;
+       mwapi:bindProperty ?awardPropB ;
+       mwapi:bindItem ?nobelPhysics .
   }
   SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "Nobel Prize in Physics" .
-    bd:serviceParam mwapi:type "item" .
-    bd:serviceParam wikibase:limit "1" .
-    ?nobelPhysics wikibase:apiOutputItem mwapi:item .
+    [] mwapi:search "country of citizenship" ; mwapi:type "property" ; mwapi:bind ?citizenshipProp .
   }
   ?person ?awardProp ?nobelPhysics .
   ?person ?citizenshipProp ?country .
@@ -301,40 +272,26 @@ SELECT DISTINCT ?company ?label ?cityLabel ?inception WHERE {
     unit:hasSPARQLQueryUnitTest """
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-PREFIX wikibase: <http://wikiba.se/ontology#>
 PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
-PREFIX bd: <http://www.bigdata.com/rdf#>
 
 SELECT DISTINCT ?company ?label ?cityLabel ?inception WHERE {
+  # mwapi:searchRelation, split across two calls (see CQ1). Unlike CQ3,
+  # ?company ?instanceOfProp ?breweryClass is a direct triple, so the
+  # relation form's live-verification applies cleanly here.
   SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "capital of" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?capitalOfProp wikibase:apiOutput mwapi:directProperty .
+    [] mwapi:searchRelation "instance of brewery" ;
+       mwapi:bindProperty ?instanceOfProp ;
+       mwapi:bindItem ?breweryClassA .
   }
   SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "headquarters location" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?hqProp wikibase:apiOutput mwapi:directProperty .
+    [] mwapi:searchRelation "instance of brewery" ;
+       mwapi:bindProperty ?instanceOfPropB ;
+       mwapi:bindItem ?breweryClass .
   }
   SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "inception" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?inceptionProp wikibase:apiOutput mwapi:directProperty .
-  }
-  SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "instance of" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?instanceOfProp wikibase:apiOutput mwapi:directProperty .
-  }
-  SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "brewery" .
-    bd:serviceParam mwapi:type "item" .
-    bd:serviceParam wikibase:limit "1" .
-    ?breweryClass wikibase:apiOutputItem mwapi:item .
+    [] mwapi:search "capital of" ; mwapi:type "property" ; mwapi:bind ?capitalOfProp .
+    [] mwapi:search "headquarters location" ; mwapi:type "property" ; mwapi:bind ?hqProp .
+    [] mwapi:search "inception" ; mwapi:type "property" ; mwapi:bind ?inceptionProp .
   }
   ?city ?capitalOfProp ?country .
   ?company ?hqProp ?city .
@@ -366,22 +323,16 @@ ex:CQ7 a unit:CompetencyQuestionVerification ;
     unit:hasCompetencyQuestion "What are Gweru, Zimbabwe's parent administrative region and that region's parent country?" ;
     unit:hasSPARQLQueryUnitTest """
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-PREFIX wikibase: <http://wikiba.se/ontology#>
 PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
-PREFIX bd: <http://www.bigdata.com/rdf#>
 
 SELECT ?regionLabel ?countryLabel WHERE {
+  # mwapi:bind: the same phrase resolved twice into distinct variables
+  # (?locatedInProp1/?locatedInProp2), one round trip -- each hop still
+  # gets its own SPARQL variable, which is what this CQ's header comment
+  # requires.
   SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "located in the administrative territorial entity" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?locatedInProp1 wikibase:apiOutput mwapi:directProperty .
-  }
-  SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "located in the administrative territorial entity" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?locatedInProp2 wikibase:apiOutput mwapi:directProperty .
+    [] mwapi:search "located in the administrative territorial entity" ; mwapi:type "property" ; mwapi:bind ?locatedInProp1 .
+    [] mwapi:search "located in the administrative territorial entity" ; mwapi:type "property" ; mwapi:bind ?locatedInProp2 .
   }
   ?gweru rdfs:label "Gweru"@en .
   ?gweru ?locatedInProp1 ?region .

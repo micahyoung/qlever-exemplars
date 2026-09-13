@@ -13,18 +13,15 @@ wikidata-truthy/*.ops
 wikidata-truthy/*.ops.meta
 wikidata-truthy/*.patterns
 
-# Property-search service: venv + generated embedding index (rebuild via
+# Property-search service: venv + generated lexical index (rebuild via
 # build_index.py). Ignore base files by name (not the whole directory) so
 # the small tier-3 learned-overlay files below can be un-ignored and
 # tracked -- they're the audit trail / undo mechanism for tier-3 writes.
 wikidata-property-search/.venv/
-wikidata-property-search/index/*.npy
 wikidata-property-search/index/meta.json
 !wikidata-property-search/index/learned_aliases.json
-wikidata-property-search/index_items/*.npy
 wikidata-property-search/index_items/meta.json
 !wikidata-property-search/index_items/learned_entities.json
-!wikidata-property-search/index_items/learned_vectors.npy
 
 # Pattern for any future dataset directories
 */*.nt.bz2

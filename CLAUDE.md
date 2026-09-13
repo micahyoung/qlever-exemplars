@@ -15,11 +15,11 @@ qlever/
 │   ├── latest-truthy.nt.bz2     # 40 GB source dump
 │   ├── wikidata-truthy.*        # index, vocabulary, and log files
 │   └── wikidata-truthy.internal.index.*
-├── wikidata-property-search/    # semantic property/item-search SERVICE (port 7002)
-│   ├── build_index.py           # embeds property and item text into both indices below
+├── wikidata-property-search/    # property/item-search SERVICE (port 7002)
+│   ├── build_index.py           # fetches property and item metadata into both indices below
 │   ├── server.py                # mwapi-style SPARQL SERVICE endpoint
-│   ├── index/                   # property index: vectors.npy + meta.json
-│   └── index_items/             # item (class/type) index: vectors.npy + meta.json
+│   ├── index/                   # property index: meta.json
+│   └── index_items/             # item (class/type) index: meta.json
 └── yago-4/                      # self-contained dataset (port 9004)
     ├── Qleverfile               # QLever INI-style config
     ├── yago-4.6-*.zip           # 6 source dump files, ~10 GB total
@@ -46,9 +46,9 @@ rm -f wikidata-truthy.* wikidata-truthy.internal.index.*
 ## Querying
 
 **SERVICE is the default for resolving predicates from natural language.**
-Never probe predicate frequencies to discover properties — SERVICE handles exact matches (pinned first) and semantic similarity for `mwapi:type "property"`.
+Never probe predicate frequencies to discover properties — SERVICE handles exact matches (pinned first, and preferred over any looser alias match — see below) for `mwapi:type "property"`.
 
-**SERVICE can attempt general entity resolution, but it's best-effort.** `mwapi:type "item"` indexes the ~114k entities that appear as the object of a `P31` ("instance of") triple somewhere in the dataset — i.e. class/type entities like `Q5` (human) or `Q515` (city) — and resolves those instantly. For everything else (e.g. "Marie Curie", "the Big Apple"), it now falls back to a tier-3 resolver: an LLM proposes candidate canonical names, each is verified with a **live** exact-match query against QLever itself (not just the precomputed index), and same-labeled candidates are disambiguated by statement count. This is not guaranteed to resolve, and has LLM-round-trip latency (can be several seconds to tens of seconds) on a cache miss — successful resolutions are persisted, so a repeat query for the same phrase becomes an instant exact-match hit. If you want guaranteed, fast, manual control over entity resolution instead (or SERVICE/tier-3 is unavailable), use a direct `rdfs:label` **exact-match** query yourself:
+**SERVICE can attempt general entity resolution, but it's best-effort.** `mwapi:type "item"` indexes the ~114k entities that appear as the object of a `P31` ("instance of") triple somewhere in the dataset — i.e. class/type entities like `Q5` (human) or `Q515` (city) — and resolves those instantly. For everything else (e.g. "Marie Curie", "the Big Apple"), it falls back to a tier-3 resolver: an LLM proposes candidate canonical names, each is verified with a **live** exact-match query against QLever itself (not just the precomputed index), and same-labeled candidates are disambiguated by statement count. This is not guaranteed to resolve, and has LLM-round-trip latency (can be several seconds to tens of seconds) on a cache miss — successful resolutions are persisted, so a repeat query for the same phrase becomes an instant exact-match hit. If you want guaranteed, fast, manual control over entity resolution instead (or SERVICE/tier-3 is unavailable), use a direct `rdfs:label` **exact-match** query yourself:
 
 ```sparql
 SELECT ?item ?label WHERE {
@@ -62,6 +62,8 @@ Never use `FILTER(CONTAINS(?label, "..."))` (or any other unanchored label scan)
 ### Step 1: Resolve
 
 Use SERVICE to resolve every predicate from the prompt. For named entities, a single `mwapi:type "item"` SERVICE call may now resolve common ones directly (via the tier-3 fallback described above); the direct `rdfs:label` exact-match query remains the fast, deterministic, manual fallback — reach for it when you want guaranteed disambiguation control, or when SERVICE/tier-3 doesn't resolve something. This is typically 2 queries up front (one SERVICE call can batch multiple predicates; a manual entity lookup, when needed, is separate).
+
+**Prefer `mwapi:searchRelation` for `?x P Q`-shaped idioms** — anywhere a resolved property and a resolved item are the predicate and direct object of the *same* triple (type/class checks like "instance of X", award/prize relations, etc.). Resolving them jointly gives the LLM real disambiguating context a plain independent lookup can't (e.g. knowing the object is a *won* prize, not a nomination, biases toward "award received" over "nominated for"), and the resolver additionally live-verifies that the resolved triple actually occurs in the dataset — not just that each half individually exists. See the syntax reference below.
 
 ```sparql
 PREFIX wikibase: <http://wikiba.se/ontology#>
@@ -108,7 +110,9 @@ Typically **2–3 queries**: 1 SERVICE call to resolve predicates, 1 `rdfs:label
 
 Both servers must be running: QLever on `:7001`, property-search on `:7002`.
 
-**Resolve a property (ranked list):**
+There are three request shapes. **A single `SERVICE { ... }` block may contain either one legacy `mwapi:search` request, or one-or-more batch/`mwapi:searchRelation` requests — never mixed** (batch/relation requests always resolve to exactly one row; the legacy form is the only one with ranked/multi-row/labeled output).
+
+**(a) Legacy single-search — ranked list, multi-row, labeled output:**
 
 ```sparql
 SELECT ?property ?label ?score WHERE {
@@ -123,19 +127,51 @@ SELECT ?property ?label ?score WHERE {
 } ORDER BY ?score
 ```
 
-**One-shot: resolve and query in a single SPARQL** — bind `mwapi:directProperty` (the `wdt:` form) straight into predicate position:
+**(b) Batched independent properties/items — one row, `mwapi:bind` is the uniform output predicate** (binds a `wdt:`-direct-property URI for `"property"`, an entity URI for `"item"`). Use this to resolve several unrelated phrases in one round trip:
 
 ```sparql
-SELECT ?item ?itemLabel ?val WHERE {
+SELECT ?item ?itemLabel ?birth ?death WHERE {
   SERVICE <http://localhost:7002/sparql> {
-    bd:serviceParam mwapi:search "date of birth" .
-    bd:serviceParam mwapi:type "property" .
-    bd:serviceParam wikibase:limit "1" .
-    ?prop wikibase:apiOutput mwapi:directProperty .
+    [] mwapi:search "date of birth" ; mwapi:type "property" ; mwapi:bind ?birthProp .
+    [] mwapi:search "date of death" ; mwapi:type "property" ; mwapi:bind ?deathProp .
   }
   VALUES ?item { wd:Q937 wd:Q762 }
-  ?item ?prop ?val .
+  ?item ?birthProp ?birth .
+  OPTIONAL { ?item ?deathProp ?death }
   ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel)="en")
+}
+```
+
+**(c) Relation pair — jointly resolved and live-verified,** for the `?x P Q` idiom described in Step 1 above:
+
+```sparql
+SELECT ?person ?personLabel WHERE {
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:searchRelation "received the Nobel Prize in Physics" ;
+       mwapi:bindProperty ?awardProp ;
+       mwapi:bindItem ?nobelPhysics .
+  }
+  ?person ?awardProp ?nobelPhysics .
+  ?person rdfs:label ?personLabel . FILTER(LANG(?personLabel)="en")
+}
+```
+
+⚠️ **If a relation pair's two output variables both feed the same triple (as above), and that triple's subject isn't otherwise constrained elsewhere in the query, issue the relation lookup as two separate identical `SERVICE` calls, one per output variable** (see `exemplars.ttl`'s CQ1/CQ4/CQ6 for worked examples) — binding both from a single `SERVICE` result into one unconstrained-subject triple was found to make QLever's query planner choose a catastrophic plan (multi-GB allocation attempt or 60+ second hang), even with the `cache-service-results` fix below applied. The second identical call is cheap: successful relation resolutions are cached by phrase, so it's a near-instant repeat lookup, not a second LLM round trip.
+
+```sparql
+SELECT ?person ?personLabel WHERE {
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:searchRelation "received the Nobel Prize in Physics" ;
+       mwapi:bindProperty ?awardProp ;
+       mwapi:bindItem ?nobelPhysicsA .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:searchRelation "received the Nobel Prize in Physics" ;
+       mwapi:bindProperty ?awardPropB ;
+       mwapi:bindItem ?nobelPhysics .
+  }
+  ?person ?awardProp ?nobelPhysics .
+  ?person rdfs:label ?personLabel . FILTER(LANG(?personLabel)="en")
 }
 ```
 
@@ -143,16 +179,22 @@ SELECT ?item ?itemLabel ?val WHERE {
 
 | Input | Meaning |
 |---|---|
-| `mwapi:search "<phrase>"` | search phrase (required) |
-| `mwapi:type "property"` \| `"item"` | `property` (default) resolves predicates; `item` resolves the class/type entities described above instantly, plus general named entities on a best-effort basis via the tier-3 live-verification fallback |
-| `wikibase:limit "N"` | max results, default 10, capped at 50 |
+| `mwapi:search "<phrase>"` | search phrase, legacy/batch forms (required) |
+| `mwapi:searchRelation "<phrase>"` | search phrase for a joint property+item relation, relation form (required) |
+| `mwapi:type "property"` \| `"item"` | `property` (default) resolves predicates; `item` resolves the class/type entities described above instantly, plus general named entities on a best-effort basis via the tier-3 live-verification fallback. Not used by the relation form (it always resolves one property + one item together) |
+| `wikibase:limit "N"` | max results, legacy form only, default 10, capped at 50 |
 
-| Output binding | Returns |
-|---|---|
-| `?p wikibase:apiOutputItem mwapi:item` | entity URI `.../entity/Pxxx` or `.../entity/Qxxx` (carries labels) |
-| `?p wikibase:apiOutput mwapi:directProperty` | predicate URI `.../prop/direct/Pxxx` (use as `?prop` in `?s ?p ?o`); only emitted for `mwapi:type "property"`, never for `"item"` |
-| `?l wikibase:apiOutput mwapi:label` | English label |
-| `?s wikibase:apiOrdinal true` | 1-based rank |
+| Output binding | Returns | Forms |
+|---|---|---|
+| `?p wikibase:apiOutputItem mwapi:item` | entity URI `.../entity/Pxxx` or `.../entity/Qxxx` (carries labels) | legacy |
+| `?p wikibase:apiOutput mwapi:directProperty` | predicate URI `.../prop/direct/Pxxx` (use as `?prop` in `?s ?p ?o`); only emitted for `mwapi:type "property"`, never for `"item"` | legacy |
+| `?l wikibase:apiOutput mwapi:label` | English label | legacy |
+| `?s wikibase:apiOrdinal true` | 1-based rank | legacy |
+| `?v mwapi:bind` | predicate URI (property) or entity URI (item), one row only | batch |
+| `?v mwapi:bindProperty` | predicate URI, one row only | relation |
+| `?v mwapi:bindItem` | entity URI, one row only | relation |
+
+Resolution is two-tier: exact lexical match first (label matches are always preferred over alias matches when a phrase ties across rows; live statement-count notability breaks ties between multiple items sharing an identical label); if that misses, the LLM-proposed-and-verified tier-3 fallback described above.
 
 ### Start/stop the server
 
@@ -160,6 +202,11 @@ SELECT ?item ?itemLabel ?val WHERE {
 cd wikidata-truthy
 qlever start    # runs on port 7001
 qlever stop     # stop when done
+```
+
+`wikidata-truthy/Qleverfile`'s `[server]` section sets `WARMUP_CMD` to apply the `cache-service-results=true` runtime parameter automatically on every `qlever start` — this is required for the multi-variable SERVICE joins described above to run in milliseconds instead of 90+ seconds (it tells QLever it may treat SERVICE results as stable/cacheable, which skips a query-planner hazard where it otherwise eagerly tries to materialize the *other* side of the join to check if it's small enough to push down, and that eager check itself scans nearly the entire graph when the other side is a fully-unbound triple pattern). If you ever see multi-variable SERVICE joins go slow again, check it's still applied:
+```bash
+curl -s "http://localhost:7001/?cmd=get-settings&access-token=wikidata-truthy" | grep cache-service-results
 ```
 
 ### SPARQL API (HTTP)

@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Build the semantic search indices: one for properties, one for "item" entities.
+"""Build the lexical search indices: one for properties, one for "item" entities.
 
 Pulls every Wikidata property (P-id) from the local QLever endpoint together with
 its English label, description, and aliases, and separately pulls every entity
 that appears as the object of a wdt:P31 ("instance of") triple somewhere in the
 dataset (~114k "type" entities like Q5 human, Q515 city, Q4830453 business).
-Each set is embedded via the local OpenAI-compatible embedding server and saved:
+Each set is saved as:
 
-  index/vectors.npy        float32 [N, 4096], L2-normalized (one row per property)
   index/meta.json          [{"pid","uri","label","description","aliases"}, ...]
-  index_items/vectors.npy  float32 [M, 4096], L2-normalized (one row per item)
   index_items/meta.json    [{"qid","uri","label","description","aliases"}, ...]
 
 Running this script always builds both indices, in one invocation.
@@ -18,15 +16,11 @@ Re-run this whenever the truthy index is rebuilt.
 import os
 import sys
 
-import numpy as np
 import requests
 
-from index_store import atomic_save_json, atomic_save_npy, normalize_entity_row
+from index_store import atomic_save_json, normalize_entity_row
 
 QLEVER_URL = os.environ.get("QLEVER_URL", "http://localhost:7001")
-EMBED_URL = os.environ.get("EMBED_URL", "http://localhost:8888/v1/embeddings")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "qwen3-embedding-8b")
-BATCH = int(os.environ.get("EMBED_BATCH", "64"))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 INDEX_DIR = os.path.join(HERE, "index")
@@ -95,64 +89,19 @@ def fetch_entities(query, var, timeout=300):
     return entities
 
 
-def embedding_text(prop):
-    """Compose the text that represents a property for semantic matching.
-
-    This is the main quality knob: description carries the semantic signal,
-    aliases broaden recall. Tune here if recall is weak.
-    """
-    parts = [prop["label"]]
-    if prop["description"]:
-        parts.append(prop["description"])
-    if prop["aliases"]:
-        parts.append("Also known as: " + prop["aliases"])
-    return ". ".join(parts)
-
-
-def embed_batch(texts):
-    """Embed a list of strings via the local embedding server."""
-    resp = requests.post(
-        EMBED_URL,
-        json={"model": EMBED_MODEL, "input": texts},
-        timeout=300,
-    )
-    resp.raise_for_status()
-    data = resp.json()["data"]
-    # Preserve request order via the "index" field.
-    data.sort(key=lambda d: d["index"])
-    return [d["embedding"] for d in data]
-
-
 def build_and_save(label, entities, out_dir, id_key):
-    """Embed `entities`, normalize, and save vectors.npy + meta.json to out_dir."""
+    """Normalize `entities` and save meta.json to out_dir."""
     print(f"  got {len(entities)} {label}", flush=True)
 
-    texts = [embedding_text(e) for e in entities]
-    vectors = []
-    for i in range(0, len(texts), BATCH):
-        chunk = texts[i : i + BATCH]
-        vectors.extend(embed_batch(chunk))
-        print(f"  embedded {min(i + BATCH, len(texts))}/{len(texts)}", flush=True)
-
-    mat = np.asarray(vectors, dtype=np.float32)
-    # Server returns L2-normalized vectors; normalize again defensively so
-    # cosine similarity == dot product.
-    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    mat = mat / norms
-
     os.makedirs(out_dir, exist_ok=True)
-    # atomic_save_* write to temp files then atomically rename, so a crash
-    # mid-save can't leave a live index (read by the running server, and
-    # appended to by tier-3 persistence) truncated/corrupted.
-    vectors_path = os.path.join(out_dir, "vectors.npy")
+    # atomic_save_json writes to a temp file then atomically renames, so a
+    # crash mid-save can't leave a live index (read by the running server,
+    # and appended to by tier-3 persistence) truncated/corrupted.
     meta_path = os.path.join(out_dir, "meta.json")
-    atomic_save_npy(vectors_path, mat)
-
     meta = [normalize_entity_row(e, id_key) for e in entities]
     atomic_save_json(meta_path, meta)
 
-    print(f"Saved {mat.shape[0]} vectors of dim {mat.shape[1]} to {out_dir}", flush=True)
+    print(f"Saved {len(meta)} rows to {out_dir}", flush=True)
 
 
 def main():

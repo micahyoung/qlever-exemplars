@@ -48,6 +48,23 @@ ITEM_PERMUTATION_PROMPT = (
     "markdown, just the JSON array."
 )
 
+RELATION_PAIR_PROMPT = (
+    "You resolve a casual description of a fact relation into formal "
+    "Wikidata vocabulary. The relation connects a SUBJECT (implicit) to an "
+    "OBJECT via a PROPERTY, expressed as `subject --[property]--> object`. "
+    "Given a phrase describing such a relation, output ONLY a JSON array of "
+    "up to {n} candidate [property_label, object_label] pairs, ordered from "
+    "MOST to LEAST confident match. property_label must be the kind of "
+    "formal Wikidata property name you'd see in a property list (e.g. "
+    '"award received", "instance of", "headquarters location"); '
+    "object_label must be the formal/canonical name of the specific "
+    'real-world entity or class involved (e.g. "Nobel Prize in Physics", '
+    '"human", "brewery"). Example output for the phrase "won the Nobel '
+    'Prize in Physics": [["award received", "Nobel Prize in Physics"], '
+    '["nominated for", "Nobel Prize in Physics"]]. No explanation, no '
+    "markdown, just the JSON array."
+)
+
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
 
@@ -113,3 +130,32 @@ def generate_property_permutations(phrase, n=MAX_PERMUTATIONS, **kwargs):
 def generate_item_permutations(phrase, n=MAX_PERMUTATIONS, **kwargs):
     raw = chat_complete(ITEM_PERMUTATION_PROMPT.format(n=n), phrase, **kwargs)
     return parse_permutations(raw, max_items=n)
+
+
+def parse_relation_pairs(raw_text, max_items=MAX_PERMUTATIONS):
+    """Like parse_permutations, but expects a list of 2-element
+    [property_label, object_label] pairs. Never raises -- drops malformed
+    entries rather than discarding the whole list for one bad entry."""
+    if not raw_text or not raw_text.strip():
+        return []
+    text = _FENCE_RE.sub("", raw_text.strip()).strip()
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    pairs = []
+    for item in data:
+        if (
+            isinstance(item, list)
+            and len(item) == 2
+            and all(isinstance(x, str) and x.strip() for x in item)
+        ):
+            pairs.append((item[0], item[1]))
+    return pairs[:max_items]
+
+
+def generate_relation_pairs(phrase, n=MAX_PERMUTATIONS, **kwargs):
+    raw = chat_complete(RELATION_PAIR_PROMPT.format(n=n), phrase, **kwargs)
+    return parse_relation_pairs(raw, max_items=n)

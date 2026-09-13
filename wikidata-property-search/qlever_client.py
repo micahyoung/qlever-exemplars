@@ -6,6 +6,12 @@ This is what lets item resolution escape the fixed ~114k-entity ceiling:
 instead of trusting the LLM's proposed canonical name, we require it to
 exactly match a real rdfs:label already in the dataset.
 
+For relation-pair resolution (a property + item resolved jointly for the
+"?s prop item" idiom), triple_exists() adds a further live check: even once
+the property and item are each individually verified to exist, the pair as
+a whole might not co-occur (e.g. a plausible-but-wrong property paired with
+a real item). Verifying the actual triple catches that case.
+
 Disambiguation note: a live label lookup can return dozens of same-labeled
 candidates (e.g. "New York City" matched 76 distinct QIDs in testing, mostly
 minor streets/buildings, not the real city). rank_by_local_notability
@@ -93,6 +99,25 @@ def resolve_entity_uri(name, *, lookup=lookup_label_candidates, rank=rank_by_loc
     if not candidates:
         return None
     return rank(candidates, **kwargs)
+
+
+def triple_exists(prop_uri, item_uri, *, url=None, timeout=None):
+    """Live existence check for `?s <prop_uri> <item_uri>` -- used by
+    relation-pair tier-3 resolution to verify a resolved property+item pair
+    actually co-occurs in the dataset, not just that each half individually
+    exists. Uses ASK for the cheapest possible round trip (no result-row
+    materialization). ASK's response shape ({"boolean": ...}) differs from
+    SELECT's ({"results": {"bindings": ...}}), so this can't go through
+    _run_query."""
+    query = f"ASK {{ ?s <{prop_uri}> <{item_uri}> }}"
+    resp = requests.post(
+        url or QLEVER_URL,
+        data={"query": query},
+        headers={"Accept": "application/sparql-results+json"},
+        timeout=timeout if timeout is not None else QLEVER_TIER3_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return bool(resp.json().get("boolean"))
 
 
 def fetch_entity_for_index(uri, *, url=None, timeout=None):

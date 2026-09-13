@@ -145,3 +145,28 @@ def test_fetch_entity_for_index_no_results_returns_none():
     with patch("qlever_client.requests.post", return_value=mock_resp):
         entity = qlever_client.fetch_entity_for_index("http://www.wikidata.org/entity/Q999999999")
     assert entity is None
+
+
+# --- triple_exists -----------------------------------------------------------
+
+def test_triple_exists_true():
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"boolean": True, "head": {}}
+    with patch("qlever_client.requests.post", return_value=mock_resp) as mock_post:
+        result = qlever_client.triple_exists(
+            "http://www.wikidata.org/prop/direct/P166",
+            "http://www.wikidata.org/entity/Q38104",
+        )
+    assert result is True
+    sent_query = mock_post.call_args.kwargs["data"]["query"]
+    assert sent_query.startswith("ASK")
+    assert "<http://www.wikidata.org/prop/direct/P166>" in sent_query
+    assert "<http://www.wikidata.org/entity/Q38104>" in sent_query
+
+
+def test_triple_exists_false():
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"boolean": False, "head": {}}
+    with patch("qlever_client.requests.post", return_value=mock_resp):
+        result = qlever_client.triple_exists("http://example.org/p", "http://example.org/o")
+    assert result is False

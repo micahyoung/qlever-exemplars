@@ -4,7 +4,6 @@ append primitives, against real (but ephemeral, pytest-managed) temp files
 import json
 import threading
 
-import numpy as np
 import pytest
 
 import index_store
@@ -13,28 +12,13 @@ from index_store import (
     append_learned_alias,
     append_learned_entity,
     atomic_save_json,
-    atomic_save_npy,
+    load_index_bundle,
     load_learned_aliases,
     load_learned_entities,
     merge_learned_aliases,
     merge_learned_entities,
     normalize_entity_row,
 )
-
-
-def test_atomic_save_npy_writes_correct_contents_and_cleans_up_temp(tmp_path):
-    path = tmp_path / "vectors.npy"
-    arr = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
-
-    atomic_save_npy(str(path), arr)
-
-    assert path.exists()
-    loaded = np.load(str(path))
-    np.testing.assert_array_equal(loaded, arr)
-    # regression guard for the "vectors.npy.tmp.npy" double-extension quirk:
-    # no leftover temp artifacts of any name pattern.
-    leftovers = [p for p in tmp_path.iterdir() if p.name != "vectors.npy"]
-    assert leftovers == []
 
 
 def test_atomic_save_json_writes_correct_contents_and_cleans_up_temp(tmp_path):
@@ -65,18 +49,53 @@ def test_normalize_entity_row_works_for_pid_too():
     assert "id" not in result
 
 
+# --- load_index_bundle -------------------------------------------------------
+
+def test_load_index_bundle_works_from_meta_json_alone(tmp_path):
+    """No vectors.npy at all -- meta.json presence is the only thing that
+    gates loading now that tier 2's embeddings are gone."""
+    meta = [{"pid": "P106", "uri": "u106", "label": "occupation", "description": "", "aliases": ""}]
+    (tmp_path / "meta.json").write_text(json.dumps(meta))
+
+    bundle = load_index_bundle(str(tmp_path), required=True)
+
+    assert bundle.meta == meta
+    assert bundle.lex_index["occupation"] == [0]
+
+
+def test_load_index_bundle_returns_none_when_missing_and_not_required(tmp_path):
+    assert load_index_bundle(str(tmp_path / "nonexistent"), required=False) is None
+
+
+def test_load_index_bundle_prefers_label_match_over_other_rows_alias(tmp_path):
+    """Regression test: "capital" is P36's own label, but also a listed
+    alias of P1376 "capital of". With tier 2's embedding-based ranking gone,
+    the label match must win deterministically -- not whichever row
+    happens to be indexed first."""
+    meta = [
+        {"pid": "P1376", "uri": "u1376", "label": "capital of", "description": "", "aliases": "capital | seat of"},
+        {"pid": "P36", "uri": "u36", "label": "capital", "description": "", "aliases": "capital city"},
+    ]
+    (tmp_path / "meta.json").write_text(json.dumps(meta))
+
+    bundle = load_index_bundle(str(tmp_path), required=True)
+
+    assert bundle.lex_index["capital"][0] == 1  # P36 (label match), not P1376 (alias match)
+
+
+def test_load_index_bundle_raises_when_missing_and_required(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_index_bundle(str(tmp_path / "nonexistent"), required=True)
+
+
 # --- load_learned_* on a fresh checkout (files missing) --------------------
 
 def test_load_learned_aliases_returns_empty_when_file_missing(tmp_path):
     assert load_learned_aliases(str(tmp_path / "learned_aliases.json")) == []
 
 
-def test_load_learned_entities_returns_empty_when_files_missing(tmp_path):
-    meta, vectors = load_learned_entities(
-        str(tmp_path / "learned_entities.json"), str(tmp_path / "learned_vectors.npy")
-    )
-    assert meta == []
-    assert vectors is None
+def test_load_learned_entities_returns_empty_when_file_missing(tmp_path):
+    assert load_learned_entities(str(tmp_path / "learned_entities.json")) == []
 
 
 # --- merge_learned_aliases --------------------------------------------------
@@ -87,7 +106,7 @@ def _base_property_bundle():
         {"pid": "P108", "uri": "u108", "label": "employer", "description": "", "aliases": ""},
     ]
     lex_index = {"occupation": [0], "job": [0], "employer": [1]}
-    return IndexBundle(vectors=None, meta=meta, lex_index=lex_index, instruction="")
+    return IndexBundle(meta=meta, lex_index=lex_index)
 
 
 def test_merge_learned_aliases_bakes_aliases_into_base_rows_without_mutating_base_files():
@@ -130,8 +149,7 @@ def test_merge_learned_aliases_empty_list_is_noop():
 def _base_item_bundle():
     meta = [{"qid": "Q5", "uri": "uQ5", "label": "human", "description": "", "aliases": ""}]
     lex_index = {"human": [0]}
-    vectors = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
-    return IndexBundle(vectors=vectors, meta=meta, lex_index=lex_index, instruction="")
+    return IndexBundle(meta=meta, lex_index=lex_index)
 
 
 def test_merge_learned_entities_appends_after_base_rows_preserving_indices():
@@ -140,11 +158,9 @@ def test_merge_learned_entities_appends_after_base_rows_preserving_indices():
         {"qid": "Q60", "uri": "uQ60", "label": "New York City", "description": "", "aliases": "the Big Apple"},
         {"qid": "Q1297", "uri": "uQ1297", "label": "Chicago", "description": "", "aliases": "the Windy City"},
     ]
-    learned_vectors = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
 
-    merged = merge_learned_entities(bundle, learned_meta, learned_vectors)
+    merged = merge_learned_entities(bundle, learned_meta)
 
-    assert merged.vectors.shape == (3, 3)
     assert len(merged.meta) == 3
     # base row stays at index 0
     assert merged.meta[0]["qid"] == "Q5"
@@ -158,13 +174,12 @@ def test_merge_learned_entities_appends_after_base_rows_preserving_indices():
     assert merged.lex_index["the windy city"] == [2]
 
     # base bundle unmutated
-    assert bundle.vectors.shape == (1, 3)
     assert len(bundle.meta) == 1
 
 
 def test_merge_learned_entities_is_noop_when_overlay_absent():
     bundle = _base_item_bundle()
-    merged = merge_learned_entities(bundle, [], None)
+    merged = merge_learned_entities(bundle, [])
     assert merged is bundle
 
 
@@ -235,20 +250,16 @@ def test_append_learned_alias_idempotent_on_duplicate_phrase(tmp_path):
 
 def test_append_learned_entity_writes_overlay_and_normalizes_id_key(tmp_path):
     base_meta_path = tmp_path / "meta.json"
-    base_vectors_path = tmp_path / "vectors.npy"
     learned_meta_path = tmp_path / "learned_entities.json"
-    learned_vectors_path = tmp_path / "learned_vectors.npy"
 
     bundle = _base_item_bundle()
     base_meta_path.write_text(json.dumps(bundle.meta))
-    np.save(str(base_vectors_path), bundle.vectors)
     lock = threading.Lock()
 
     raw_entity = {"id": "Q60", "uri": "uQ60", "label": "New York City", "description": "", "aliases": "the Big Apple"}
-    new_vector = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
-    new_bundle, new_learned_meta, new_learned_vectors = append_learned_entity(
-        bundle, str(learned_meta_path), str(learned_vectors_path), raw_entity, new_vector, "gemma-4-26b-a4b-vision", lock
+    new_bundle, new_learned_meta = append_learned_entity(
+        bundle, str(learned_meta_path), raw_entity, "gemma-4-26b-a4b-vision", lock
     )
 
     # key was normalized "id" -> "qid" (the regression test for the drift bug)
@@ -258,45 +269,35 @@ def test_append_learned_entity_writes_overlay_and_normalizes_id_key(tmp_path):
     assert new_bundle.meta[1]["source_model"] == "gemma-4-26b-a4b-vision"
     assert "added_at" in new_bundle.meta[1]
 
-    assert new_bundle.vectors.shape == (2, 3)
-    np.testing.assert_array_equal(new_bundle.vectors[1], new_vector)
     assert new_bundle.lex_index["new york city"] == [1]
     assert new_bundle.lex_index["the big apple"] == [1]
 
-    # overlay files have the new row
+    # overlay file has the new row
     on_disk_meta = json.loads(learned_meta_path.read_text())
     assert len(on_disk_meta) == 1
     assert on_disk_meta[0]["qid"] == "Q60"
-    on_disk_vectors = np.load(str(learned_vectors_path))
-    assert on_disk_vectors.shape == (1, 3)
 
-    # base files are NEVER touched by this function
+    # base file is NEVER touched by this function
     assert json.loads(base_meta_path.read_text()) == bundle.meta
-    on_disk_base_vectors = np.load(str(base_vectors_path))
-    np.testing.assert_array_equal(on_disk_base_vectors, bundle.vectors)
 
     # old bundle unmutated
-    assert bundle.vectors.shape == (1, 3)
     assert len(bundle.meta) == 1
 
 
 def test_append_learned_entity_idempotent_on_duplicate_uri(tmp_path):
     learned_meta_path = tmp_path / "learned_entities.json"
-    learned_vectors_path = tmp_path / "learned_vectors.npy"
     bundle = _base_item_bundle()
     lock = threading.Lock()
 
     raw_entity = {"id": "Q60", "uri": "uQ60", "label": "New York City", "description": "", "aliases": ""}
-    vector = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
-    first_bundle, first_meta, first_vectors = append_learned_entity(
-        bundle, str(learned_meta_path), str(learned_vectors_path), raw_entity, vector, "m", lock
+    first_bundle, first_meta = append_learned_entity(
+        bundle, str(learned_meta_path), raw_entity, "m", lock
     )
-    second_bundle, second_meta, second_vectors = append_learned_entity(
-        first_bundle, str(learned_meta_path), str(learned_vectors_path), raw_entity, vector, "m", lock
+    second_bundle, second_meta = append_learned_entity(
+        first_bundle, str(learned_meta_path), raw_entity, "m", lock
     )
 
     assert second_bundle is first_bundle
     assert second_meta is None
-    assert second_vectors is None
-    assert second_bundle.vectors.shape == (2, 3)  # not appended twice
+    assert len(second_bundle.meta) == 2  # not appended twice

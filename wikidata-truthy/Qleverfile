@@ -26,6 +26,17 @@ MEMORY_FOR_QUERIES          = 20G
 CACHE_MAX_SIZE              = 15G
 CACHE_MAX_SIZE_SINGLE_ENTRY = 5G
 TIMEOUT                     = 600s
+# Without this, a SPARQL query that joins a SERVICE-resolved predicate AND a
+# SERVICE-resolved object into the same triple (e.g. the property-search
+# SERVICE's mwapi:searchRelation idiom) can trigger a QLever query-planner
+# hazard: Service::precomputeSiblingResult eagerly tries to materialize the
+# non-SERVICE side of the join to check if it's small enough to push down as
+# a VALUES clause, and when that side is a fully-unbound triple pattern this
+# eager check scans nearly the entire graph (confirmed: 90+s, ~7.5B rows
+# touched, on a query that runs in <1s with this set). Setting
+# cache-service-results=true tells QLever it may treat SERVICE results as
+# stable/cacheable, which skips that eager check.
+WARMUP_CMD                  = curl -s "http://localhost:${PORT}/?cache-service-results=true&access-token=${ACCESS_TOKEN}" > /dev/null
 
 [runtime]
 SYSTEM = native
