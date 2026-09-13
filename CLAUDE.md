@@ -10,15 +10,20 @@ This directory hosts a local [QLever](https://docs.qlever.dev/) SPARQL endpoint 
 qlever/
 ├── CLAUDE.md                    # this file
 ├── qlever.sources               # deb822 apt source (system-wide)
-├── wikidata-truthy/             # self-contained dataset
+├── wikidata-truthy/             # self-contained dataset (port 7001)
 │   ├── Qleverfile               # QLever INI-style config
 │   ├── latest-truthy.nt.bz2     # 40 GB source dump
 │   ├── wikidata-truthy.*        # index, vocabulary, and log files
 │   └── wikidata-truthy.internal.index.*
-└── wikidata-property-search/    # semantic property-search SERVICE (port 7002)
-    ├── build_index.py           # embeds property text from the index
-    ├── server.py                # mwapi-style SPARQL SERVICE endpoint
-    └── index/                   # vectors.npy + meta.json
+├── wikidata-property-search/    # semantic property/item-search SERVICE (port 7002)
+│   ├── build_index.py           # embeds property and item text into both indices below
+│   ├── server.py                # mwapi-style SPARQL SERVICE endpoint
+│   ├── index/                   # property index: vectors.npy + meta.json
+│   └── index_items/             # item (class/type) index: vectors.npy + meta.json
+└── yago-4/                      # self-contained dataset (port 9004)
+    ├── Qleverfile               # QLever INI-style config
+    ├── yago-4.6-*.zip           # 6 source dump files, ~10 GB total
+    └── yago-4.*                 # index, vocabulary, and log files
 ```
 
 Additional datasets can be added as sibling directories (e.g., `another-dataset/`), each with its own `Qleverfile` and index, running independently on separate ports.
@@ -43,7 +48,7 @@ rm -f wikidata-truthy.* wikidata-truthy.internal.index.*
 **SERVICE is the default for resolving predicates from natural language.**
 Never probe predicate frequencies to discover properties — SERVICE handles exact matches (pinned first) and semantic similarity for `mwapi:type "property"`.
 
-**SERVICE does NOT resolve entities.** Despite `mwapi:type` looking like it should accept `"item"`, the current `server.py` only implements `"property"` and returns `400 Bad Request` for anything else. Resolve entities with a direct `rdfs:label` **exact-match** query instead:
+**SERVICE can attempt general entity resolution, but it's best-effort.** `mwapi:type "item"` indexes the ~114k entities that appear as the object of a `P31` ("instance of") triple somewhere in the dataset — i.e. class/type entities like `Q5` (human) or `Q515` (city) — and resolves those instantly. For everything else (e.g. "Marie Curie", "the Big Apple"), it now falls back to a tier-3 resolver: an LLM proposes candidate canonical names, each is verified with a **live** exact-match query against QLever itself (not just the precomputed index), and same-labeled candidates are disambiguated by statement count. This is not guaranteed to resolve, and has LLM-round-trip latency (can be several seconds to tens of seconds) on a cache miss — successful resolutions are persisted, so a repeat query for the same phrase becomes an instant exact-match hit. If you want guaranteed, fast, manual control over entity resolution instead (or SERVICE/tier-3 is unavailable), use a direct `rdfs:label` **exact-match** query yourself:
 
 ```sparql
 SELECT ?item ?label WHERE {
@@ -56,7 +61,7 @@ Never use `FILTER(CONTAINS(?label, "..."))` (or any other unanchored label scan)
 
 ### Step 1: Resolve
 
-Use SERVICE to resolve every predicate from the prompt, and a direct `rdfs:label` exact-match query to resolve every named entity. This is typically 2 queries up front (one SERVICE call can batch multiple predicates; the entity lookup is separate since SERVICE doesn't cover it).
+Use SERVICE to resolve every predicate from the prompt. For named entities, a single `mwapi:type "item"` SERVICE call may now resolve common ones directly (via the tier-3 fallback described above); the direct `rdfs:label` exact-match query remains the fast, deterministic, manual fallback — reach for it when you want guaranteed disambiguation control, or when SERVICE/tier-3 doesn't resolve something. This is typically 2 queries up front (one SERVICE call can batch multiple predicates; a manual entity lookup, when needed, is separate).
 
 ```sparql
 PREFIX wikibase: <http://wikiba.se/ontology#>
@@ -139,13 +144,13 @@ SELECT ?item ?itemLabel ?val WHERE {
 | Input | Meaning |
 |---|---|
 | `mwapi:search "<phrase>"` | search phrase (required) |
-| `mwapi:type "property"` | must be `property` |
+| `mwapi:type "property"` \| `"item"` | `property` (default) resolves predicates; `item` resolves the class/type entities described above instantly, plus general named entities on a best-effort basis via the tier-3 live-verification fallback |
 | `wikibase:limit "N"` | max results, default 10, capped at 50 |
 
 | Output binding | Returns |
 |---|---|
-| `?p wikibase:apiOutputItem mwapi:item` | entity URI `.../entity/Pxxx` (carries labels) |
-| `?p wikibase:apiOutput mwapi:directProperty` | predicate URI `.../prop/direct/Pxxx` (use as `?prop` in `?s ?p ?o`) |
+| `?p wikibase:apiOutputItem mwapi:item` | entity URI `.../entity/Pxxx` or `.../entity/Qxxx` (carries labels) |
+| `?p wikibase:apiOutput mwapi:directProperty` | predicate URI `.../prop/direct/Pxxx` (use as `?prop` in `?s ?p ?o`); only emitted for `mwapi:type "property"`, never for `"item"` |
 | `?l wikibase:apiOutput mwapi:label` | English label |
 | `?s wikibase:apiOrdinal true` | 1-based rank |
 

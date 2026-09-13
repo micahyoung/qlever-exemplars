@@ -83,6 +83,10 @@ SELECT ?item ?label ?birth ?death WHERE {
 # CQ2 — Relationship / hierarchy traversal
 #################################################################
 
+# No SERVICE variant: this CQ's only predicate is wdt:P131+, and SPARQL
+# property-path modifiers (+/*) cannot be applied to a variable predicate —
+# QLever rejects "?prop+" as a parse error. The property must stay a
+# hardcoded IRI, so there is nothing left for SERVICE to resolve.
 ex:CQ2 a unit:CompetencyQuestionVerification ;
     rdfs:label "CQ2 - Hierarchy traversal" ;
     unit:testsOntology ex:WikidataTruthyDataset ;
@@ -246,6 +250,27 @@ SELECT DISTINCT ?item ?label ?pop WHERE {
   ?item wdt:P1082 ?pop .
   BIND("Springfield"@en AS ?label)
 }
+""" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX wikibase: <http://wikiba.se/ontology#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+PREFIX bd: <http://www.bigdata.com/rdf#>
+
+SELECT DISTINCT ?item ?label ?pop WHERE {
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "population" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?popProp wikibase:apiOutput mwapi:directProperty .
+  }
+  ?item rdfs:label "Springfield"@en .
+  ?item wdt:P131* wd:Q1204 .
+  ?item ?popProp ?pop .
+  BIND("Springfield"@en AS ?label)
+}
 """ .
 
 #################################################################
@@ -319,4 +344,92 @@ SELECT DISTINCT ?company ?label ?cityLabel ?inception WHERE {
   ?company rdfs:label ?label . FILTER(LANG(?label)="en")
   ?city rdfs:label ?cityLabel . FILTER(LANG(?cityLabel)="en")
 } ORDER BY ?inception LIMIT 15
+""" .
+
+#################################################################
+# CQ7 — Bounded-depth hierarchy traversal, fully dynamic
+#
+# Variant of CQ2 that avoids the wdt:P131+ property-path modifier (which
+# cannot be applied to a SERVICE-resolved variable predicate) by unrolling
+# two explicit hops instead of unbounded recursion. Nothing is hardcoded:
+# the entity is resolved via rdfs:label, and the property is resolved twice
+# via SERVICE (once per hop, under separate variable names) rather than
+# reused across both triples — reusing one SERVICE-bound variable across two
+# index scans defeats QLever's query planner and forces an unconstrained
+# ~65GB scan.
+#################################################################
+
+ex:CQ7 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ7 - Bounded-depth hierarchy traversal (dynamic CQ2 variant)" ;
+    unit:testsOntology ex:WikidataTruthyDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "What are Gweru, Zimbabwe's parent administrative region and that region's parent country?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wikibase: <http://wikiba.se/ontology#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+PREFIX bd: <http://www.bigdata.com/rdf#>
+
+SELECT ?regionLabel ?countryLabel WHERE {
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "located in the administrative territorial entity" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?locatedInProp1 wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "located in the administrative territorial entity" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?locatedInProp2 wikibase:apiOutput mwapi:directProperty .
+  }
+  ?gweru rdfs:label "Gweru"@en .
+  ?gweru ?locatedInProp1 ?region .
+  ?region ?locatedInProp2 ?country .
+  ?region rdfs:label ?regionLabel . FILTER(LANG(?regionLabel)="en")
+  ?country rdfs:label ?countryLabel . FILTER(LANG(?countryLabel)="en")
+}
+""" .
+
+#################################################################
+# CQ8 — Disambiguation via single-hop relation, fully dynamic
+#
+# Variant of CQ5 that avoids the wdt:P131* property-path modifier by
+# disambiguating "Springfield" through a single-hop "capital" relation
+# (P36) instead of an unbounded administrative-hierarchy walk. Nothing is
+# hardcoded: "Illinois" resolves via rdfs:label (12 label-alike candidates
+# exist, but only the real state has a P36 capital with a P1082 population,
+# so the join naturally disambiguates it), and both properties resolve via
+# SERVICE.
+#################################################################
+
+ex:CQ8 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ8 - Disambiguation via single-hop relation (dynamic CQ5 variant)" ;
+    unit:testsOntology ex:WikidataTruthyDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "What is the population of the Springfield that is the capital of Illinois?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wikibase: <http://wikiba.se/ontology#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+PREFIX bd: <http://www.bigdata.com/rdf#>
+
+SELECT ?item ?label ?pop WHERE {
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "capital" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?capitalProp wikibase:apiOutput mwapi:directProperty .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    bd:serviceParam mwapi:search "population" .
+    bd:serviceParam mwapi:type "property" .
+    bd:serviceParam wikibase:limit "1" .
+    ?popProp wikibase:apiOutput mwapi:directProperty .
+  }
+  ?illinois rdfs:label "Illinois"@en .
+  ?illinois ?capitalProp ?item .
+  ?item ?popProp ?pop .
+  ?item rdfs:label ?label . FILTER(LANG(?label)="en")
+}
 """ .

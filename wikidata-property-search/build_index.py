@@ -15,12 +15,13 @@ Each set is embedded via the local OpenAI-compatible embedding server and saved:
 Running this script always builds both indices, in one invocation.
 Re-run this whenever the truthy index is rebuilt.
 """
-import json
 import os
 import sys
 
 import numpy as np
 import requests
+
+from index_store import atomic_save_json, atomic_save_npy, normalize_entity_row
 
 QLEVER_URL = os.environ.get("QLEVER_URL", "http://localhost:7001")
 EMBED_URL = os.environ.get("EMBED_URL", "http://localhost:8888/v1/embeddings")
@@ -141,26 +142,15 @@ def build_and_save(label, entities, out_dir, id_key):
     mat = mat / norms
 
     os.makedirs(out_dir, exist_ok=True)
-    # Write to temp files then atomically rename, so a crash mid-save can't
-    # leave a live index (read by the running server) truncated/corrupted.
+    # atomic_save_* write to temp files then atomically rename, so a crash
+    # mid-save can't leave a live index (read by the running server, and
+    # appended to by tier-3 persistence) truncated/corrupted.
     vectors_path = os.path.join(out_dir, "vectors.npy")
     meta_path = os.path.join(out_dir, "meta.json")
-    np.save(vectors_path + ".tmp", mat)
-    os.replace(vectors_path + ".tmp.npy", vectors_path)
+    atomic_save_npy(vectors_path, mat)
 
-    meta = [
-        {
-            id_key: e["id"],
-            "uri": e["uri"],
-            "label": e["label"],
-            "description": e["description"],
-            "aliases": e["aliases"],  # " | "-separated; used for the lexical pin
-        }
-        for e in entities
-    ]
-    with open(meta_path + ".tmp", "w") as f:
-        json.dump(meta, f)
-    os.replace(meta_path + ".tmp", meta_path)
+    meta = [normalize_entity_row(e, id_key) for e in entities]
+    atomic_save_json(meta_path, meta)
 
     print(f"Saved {mat.shape[0]} vectors of dim {mat.shape[1]} to {out_dir}", flush=True)
 

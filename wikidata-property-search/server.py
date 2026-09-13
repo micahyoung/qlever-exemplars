@@ -11,8 +11,16 @@ Two independent indices are served, selected by `mwapi:type`:
   "item"               - the ~114k entities used as the object of a wdt:P31
                           ("instance of") triple somewhere in the dataset, i.e.
                           "type/class" entities like Q5 (human), Q515 (city).
-                          This is NOT general entity search over all ~100M
-                          Wikidata entities - see CLAUDE.md for why.
+
+Both types also have a tier-3 fallback (see resolver.py) that fires when the
+first two tiers (exact lexical match, then embedding similarity) both miss:
+an LLM proposes formal-name permutations of the phrase, which are then
+verified deterministically -- against the local lexical index for
+properties, or LIVE against QLever's rdfs:label for items, which lets item
+resolution reach beyond the precomputed ~114k class universe to general
+named entities (e.g. "Marie Curie", "the Big Apple"). Tier 3 is best-effort
+(not guaranteed to resolve, and slower than tiers 1-2); successful
+resolutions are persisted so repeat queries become instant tier-1 hits.
 
 It does NOT implement general SPARQL. It recognizes a fixed set of
 `bd:serviceParam` inputs and a fixed set of output-binding triples, extracted by
@@ -33,17 +41,36 @@ Outputs (subject var is bound for each ranked hit):
 import json
 import os
 import re
-from collections import namedtuple
+import threading
 
 import numpy as np
 import requests
 from flask import Flask, request, Response
+
+import llm_client
+import qlever_client
+import resolver
+from index_store import (
+    IndexBundle,
+    append_learned_alias,
+    append_learned_entity,
+    load_index_bundle,
+    load_learned_aliases,
+    load_learned_entities,
+    merge_learned_aliases,
+    merge_learned_entities,
+    normalize,
+)
 
 EMBED_URL = os.environ.get("EMBED_URL", "http://localhost:8888/v1/embeddings")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "qwen3-embedding-8b")
 PORT = int(os.environ.get("PORT", "7002"))
 MAX_LIMIT = 50
 DEFAULT_LIMIT = 10
+
+# --- tier-3 config ---------------------------------------------------------
+TIER3_ENABLED = os.environ.get("TIER3_ENABLED", "true").lower() == "true"
+TIER3_MIN_SCORE = float(os.environ.get("TIER3_MIN_SCORE", "0.70"))
 
 ENTITY_PREFIX = "http://www.wikidata.org/entity/"
 DIRECT_PREFIX = "http://www.wikidata.org/prop/direct/"
@@ -52,46 +79,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 INDEX_DIR = os.path.join(HERE, "index")
 ITEM_INDEX_DIR = os.path.join(HERE, "index_items")
 
+# Base files: written ONLY by build_index.py, frozen at runtime.
+INDEX_META_PATH = os.path.join(INDEX_DIR, "meta.json")
+ITEM_INDEX_META_PATH = os.path.join(ITEM_INDEX_DIR, "meta.json")
+ITEM_INDEX_VECTORS_PATH = os.path.join(ITEM_INDEX_DIR, "vectors.npy")
 
-def normalize(text):
-    """Lowercase + collapse whitespace for exact lexical matching."""
-    return re.sub(r"\s+", " ", text.strip().lower())
-
-
-IndexBundle = namedtuple("IndexBundle", ["vectors", "meta", "lex_index", "instruction"])
-
-
-def load_index_bundle(dir_path, instruction, required):
-    """Load vectors.npy + meta.json from dir_path into an IndexBundle.
-
-    Returns None (instead of raising) if the directory/files don't exist and
-    `required` is False, so the server can still start and serve the other
-    index while e.g. the item index hasn't been built yet.
-    """
-    vec_path = os.path.join(dir_path, "vectors.npy")
-    meta_path = os.path.join(dir_path, "meta.json")
-    if not (os.path.exists(vec_path) and os.path.exists(meta_path)):
-        if required:
-            raise FileNotFoundError(f"required index missing at {dir_path}")
-        print(f"WARNING: index not found at {dir_path}, skipping", flush=True)
-        return None
-
-    vectors = np.load(vec_path)
-    with open(meta_path) as f:
-        meta = json.load(f)
-    assert vectors.shape[0] == len(meta), f"vectors/meta length mismatch in {dir_path}"
-
-    # Lexical index: normalized label/alias -> row indices. Pure-semantic
-    # ranking demotes exact-name matches (a hit whose *description* quotes the
-    # phrase can outscore the one whose *label* IS the phrase), so we pin
-    # exact label/alias matches to the top of the results.
-    lex_index = {}
-    for i, m in enumerate(meta):
-        surface = [m["label"]] + [a for a in m.get("aliases", "").split(" | ") if a]
-        for s in surface:
-            lex_index.setdefault(normalize(s), []).append(i)
-
-    return IndexBundle(vectors, meta, lex_index, instruction)
+# Learned-overlay files: tier-3-only, merged with the base at load time.
+# Kept structurally separate from the base so "what did tier-3 add" is a
+# direct file read and "undo a bad tier-3 write" never risks the base data.
+LEARNED_ALIASES_PATH = os.path.join(INDEX_DIR, "learned_aliases.json")
+LEARNED_ITEMS_META_PATH = os.path.join(ITEM_INDEX_DIR, "learned_entities.json")
+LEARNED_ITEMS_VECTORS_PATH = os.path.join(ITEM_INDEX_DIR, "learned_vectors.npy")
 
 
 # --- load indices --------------------------------------------------------------
@@ -104,12 +102,62 @@ ITEM_INSTRUCTION = (
     "meaning best matches it.\nQuery: "
 )
 
-PROPERTY_INDEX = load_index_bundle(INDEX_DIR, PROPERTY_INSTRUCTION, required=True)
-ITEM_INDEX = load_index_bundle(ITEM_INDEX_DIR, ITEM_INSTRUCTION, required=False)
+_property_base = load_index_bundle(INDEX_DIR, PROPERTY_INSTRUCTION, required=True)
+PROPERTY_LEARNED_ALIASES = load_learned_aliases(LEARNED_ALIASES_PATH)
+PROPERTY_INDEX = merge_learned_aliases(_property_base, PROPERTY_LEARNED_ALIASES)
+
+_item_base = load_index_bundle(ITEM_INDEX_DIR, ITEM_INSTRUCTION, required=False)
+if _item_base is not None:
+    ITEM_LEARNED_META, ITEM_LEARNED_VECTORS = load_learned_entities(
+        LEARNED_ITEMS_META_PATH, LEARNED_ITEMS_VECTORS_PATH
+    )
+    ITEM_INDEX = merge_learned_entities(_item_base, ITEM_LEARNED_META, ITEM_LEARNED_VECTORS)
+else:
+    ITEM_LEARNED_META, ITEM_LEARNED_VECTORS = [], None
+    ITEM_INDEX = None
 
 INDEXES = {"property": PROPERTY_INDEX, "item": ITEM_INDEX}
 
+# One lock per bundle, held only around the mutate-and-swap of a tier-3
+# persistence write (never around the slow LLM/QLever calls that precede
+# it), so concurrent reads are never blocked by a write in progress.
+INDEX_LOCKS = {"property": threading.Lock(), "item": threading.Lock()}
+
 app = Flask(__name__)
+
+
+# --- tier-3 persistence (real implementations, injected into resolver.py) -----
+def _persist_property_alias(row_index, alias):
+    """Real `persist` callback for resolve_property_tier3: attaches `alias`
+    to the existing property row and records it in the learned-overlay file
+    so future identical queries hit tier 1 -- the base meta.json is never
+    touched."""
+    global PROPERTY_INDEX, PROPERTY_LEARNED_ALIASES
+    new_bundle, new_learned = append_learned_alias(
+        PROPERTY_INDEX, LEARNED_ALIASES_PATH, row_index, alias,
+        llm_client.CHAT_MODEL, INDEX_LOCKS["property"],
+    )
+    PROPERTY_INDEX = new_bundle
+    if new_learned is not None:  # None means the write was a no-op duplicate
+        PROPERTY_LEARNED_ALIASES = new_learned
+    INDEXES["property"] = new_bundle
+
+
+def _persist_item_row(entity, vector):
+    """Real `persist` callback for resolve_item_tier3: appends a brand-new
+    entity row (never an existing one -- see resolver.py's docstring) to the
+    item learned-overlay files. The base meta.json/vectors.npy are never
+    touched."""
+    global ITEM_INDEX, ITEM_LEARNED_META, ITEM_LEARNED_VECTORS
+    new_bundle, new_meta, new_vectors = append_learned_entity(
+        ITEM_INDEX, LEARNED_ITEMS_META_PATH, LEARNED_ITEMS_VECTORS_PATH,
+        entity, vector, llm_client.CHAT_MODEL, INDEX_LOCKS["item"],
+    )
+    ITEM_INDEX = new_bundle
+    if new_meta is not None:  # None means the write was a no-op duplicate
+        ITEM_LEARNED_META = new_meta
+        ITEM_LEARNED_VECTORS = new_vectors
+    INDEXES["item"] = new_bundle
 
 # --- request parsing ----------------------------------------------------------
 # Each term may arrive prefixed (mwapi:search) or as a full IRI after QLever
@@ -197,12 +245,17 @@ def embed(phrase, instruction):
     return v / n if n else v
 
 
-def search(phrase, limit, bundle):
-    """Return top-`limit` meta rows from `bundle`: exact label/alias matches
-    pinned first (ordered among themselves by semantic score), then pure
-    semantic for the rest."""
+def search_with_score(phrase, limit, bundle):
+    """Return top-`limit` meta rows from `bundle` (exact label/alias matches
+    pinned first, ordered among themselves by semantic score, then pure
+    semantic for the rest) alongside the raw top cosine score, as
+    (hits, top_score) -- the score is needed to decide whether tier 3 should
+    fire. `top_score` reflects the best PURE embedding score (before lexical
+    pinning), which is fine: if a lexical pin exists, tier 3 is never even
+    considered (tier 1 already succeeded)."""
     q = embed(phrase, bundle.instruction)
     scores = bundle.vectors @ q
+    top_score = float(scores.max()) if len(scores) else 0.0
 
     pinned = sorted(
         set(bundle.lex_index.get(normalize(phrase), [])), key=lambda i: -scores[i]
@@ -216,7 +269,7 @@ def search(phrase, limit, bundle):
                 result.append(i)
                 if len(result) >= limit:
                     break
-    return [bundle.meta[i] for i in result]
+    return [bundle.meta[i] for i in result], top_score
 
 
 # --- SPARQL results JSON ------------------------------------------------------
@@ -271,6 +324,41 @@ def get_query():
         or request.get_data(as_text=True)
 
 
+def _maybe_resolve_tier3(phrase, ptype, bundle, top_score):
+    """Tier-2->tier-3 routing decision. Fires only when tier 1 ALSO missed
+    (an exact lexical hit means tier 1 already succeeded, making tier 3
+    moot) and tier 2's top score is below TIER3_MIN_SCORE. Resolution
+    failures (bad LLM output, timeouts, live-QLever errors) are caught here
+    and treated as a tier-3 miss -- the caller falls back to tier-2-only
+    results, response stays 200, never 500."""
+    if not TIER3_ENABLED:
+        return None
+    if not resolver.should_attempt_tier3(phrase, bundle, top_score, TIER3_MIN_SCORE):
+        return None
+
+    try:
+        if ptype == "property":
+            return resolver.resolve_property_tier3(
+                phrase,
+                bundle,
+                llm_client.generate_property_permutations,
+                _persist_property_alias,
+            )
+        if ptype == "item":
+            return resolver.resolve_item_tier3(
+                phrase,
+                llm_client.generate_item_permutations,
+                qlever_client.resolve_entity_uri,
+                qlever_client.fetch_entity_for_index,
+                lambda text: embed(text, ""),
+                _persist_item_row,
+            )
+    except Exception as exc:  # noqa: BLE001 - resolution failure -> tier-2 fallback
+        print(f"WARNING: tier-3 resolution failed for {phrase!r} ({ptype}): {exc}", flush=True)
+        return None
+    return None
+
+
 @app.route("/sparql", methods=["GET", "POST"])
 def sparql():
     query = get_query()
@@ -294,7 +382,22 @@ def sparql():
             f'mwapi:type "{ptype}" index is not loaded on this server', status=503
         )
 
-    hits = search(parsed["phrase"], parsed["limit"], bundle)
+    try:
+        hits, top_score = search_with_score(parsed["phrase"], parsed["limit"], bundle)
+    except requests.exceptions.RequestException as exc:
+        # The embedding call (tier 1/2, unconditional on every request) hit
+        # the same shared GPU gateway tier 3 uses for chat completions --
+        # under contention this can time out even for a plain embedding
+        # request. Degrade to 503 rather than an unhandled 500.
+        print(f"WARNING: embedding request failed for {parsed['phrase']!r}: {exc}", flush=True)
+        return Response("embedding service unavailable or timed out", status=503)
+
+    tier3_hit = _maybe_resolve_tier3(parsed["phrase"], ptype, bundle, top_score)
+    if tier3_hit is not None:
+        id_key = "uri"
+        hits = [tier3_hit] + [h for h in hits if h[id_key] != tier3_hit[id_key]]
+        hits = hits[: parsed["limit"]]
+
     out = build_results(parsed, hits)
     return Response(json.dumps(out), content_type="application/sparql-results+json")
 
@@ -308,6 +411,8 @@ def health():
             "dim": int(PROPERTY_INDEX.vectors.shape[1]),
             "items": len(ITEM_INDEX.meta) if ITEM_INDEX else 0,
             "item_index_loaded": ITEM_INDEX is not None,
+            "learned_property_aliases": len(PROPERTY_LEARNED_ALIASES),
+            "learned_items": len(ITEM_LEARNED_META),
         }),
         content_type="application/json",
     )
