@@ -12,6 +12,9 @@ wikidata-truthy/*-log.txt
 wikidata-truthy/*.ops
 wikidata-truthy/*.ops.meta
 wikidata-truthy/*.patterns
+wikidata-truthy/*.metrics-log.jsonl
+wikidata-truthy/*.server.resource-usage-log.tsv
+wikidata-truthy/*.sort.*.dat
 
 # Property-search service: venv + generated lexical index (rebuild via
 # build_index.py). Ignore base files by name (not the whole directory) so
@@ -22,6 +25,12 @@ wikidata-property-search/index/meta.json
 !wikidata-property-search/index/learned_aliases.json
 wikidata-property-search/index_items/meta.json
 !wikidata-property-search/index_items/learned_entities.json
+
+# yago-4: source dump archives, generated index/log files, and cloned repo
+yago-4/*.zip
+yago-4/*.metrics-log.jsonl
+yago-4/*.server.resource-usage-log.tsv
+yago-4/yago4-github/
 
 # Pattern for any future dataset directories
 */*.nt.bz2
