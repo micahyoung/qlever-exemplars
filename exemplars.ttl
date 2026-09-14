@@ -489,18 +489,20 @@ SELECT ?item ?label ?birth ?deathPlaceLabel WHERE {
 # and has zero matches on any Bhutanese mountain -- verify what a property
 # actually means before trusting its name.)
 #
-# The SERVICE-resolved variant is NOT viable: resolving "significant
-# event"/"first ascent" via mwapi:searchRelation and using the resulting
-# property+item pair inside FILTER NOT EXISTS (or MINUS, even isolated
-# into its own subquery exactly as CQ9 prescribes) both trigger the
-# unbound-predicate-object hazard at full scale (confirmed: a 65 GB
-# allocation attempt). CQ9's subquery-isolation fix only helps when the
-# isolated SERVICE-bound triple feeds a further JOIN -- it does not help
-# when that triple is instead the operand of a set-difference (NOT
-# EXISTS/MINUS). No safe single-query SERVICE composition is known for
-# this shape; if the predicate needs dynamic resolution, resolve it via a
-# separate SERVICE call first and hardcode the returned property/item IRIs
-# into the negation clause of a second query.
+# The naive SERVICE-resolved variant is NOT viable: resolving "significant
+# event"/"first ascent" jointly via mwapi:searchRelation and using the
+# resulting property+item pair inside FILTER NOT EXISTS (or MINUS, even
+# isolated into its own subquery exactly as CQ9 prescribes) both trigger
+# the unbound-predicate-object hazard at full scale (confirmed: a 65 GB
+# allocation attempt). The problem is specifically searchRelation's joint
+# two-variable binding, not negation or subquery isolation themselves --
+# confirmed by swapping in a working fix: resolve the property alone via
+# plain mwapi:search/mwapi:bind, resolve the item via a direct rdfs:label
+# exact-match (the CQ12 pattern) instead of mwapi:searchRelation, and
+# isolate the SERVICE+join in its own subquery (the CQ9 pattern). With a
+# single independently-resolved SERVICE-bound variable, both FILTER NOT
+# EXISTS and MINUS work fine and return output identical to the hardcoded
+# baseline.
 #################################################################
 
 ex:CQ10 a unit:CompetencyQuestionVerification ;
@@ -520,6 +522,32 @@ SELECT ?item ?label WHERE {
   FILTER(LANG(?label) = "en")
   FILTER NOT EXISTS { ?item wdt:P793 wd:Q1194369 }
 }
+""" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+
+SELECT ?item ?label WHERE {
+  ?item wdt:P31 wd:Q8502 ;
+        wdt:P17 wd:Q917 ;
+        rdfs:label ?label .
+  FILTER(LANG(?label) = "en")
+  # Property resolved alone via plain mwapi:search (NOT mwapi:searchRelation
+  # -- see the header comment above), item resolved via a direct rdfs:label
+  # exact-match, and the whole join isolated in its own subquery per CQ9.
+  # This combination is what makes FILTER NOT EXISTS safe here.
+  FILTER NOT EXISTS {
+    SELECT ?item WHERE {
+      SERVICE <http://localhost:7002/sparql> {
+        [] mwapi:search "significant event" ; mwapi:type "property" ; mwapi:bind ?eventProp .
+      }
+      ?firstAscent rdfs:label "first ascent"@en .
+      ?item ?eventProp ?firstAscent .
+    }
+  }
+}
 """ .
 
 #################################################################
@@ -533,14 +561,17 @@ SELECT ?item ?label WHERE {
 # wrong/incomplete answer. The fix is a UNION over both directions, not a
 # single hardcoded direction.
 #
-# The SERVICE-resolved variant is NOT viable: resolving "spouse" via
-# SERVICE and using the resulting variable predicate inside a two-
-# direction UNION triggers the same unbound-predicate-object hazard as
-# CQ9/CQ10, even when the whole SERVICE+UNION cluster is isolated into its
-# own subquery per CQ9's fix (confirmed: still hits the 30s timeout). As
-# with CQ10, no safe single-query SERVICE composition is known for this
-# shape; resolve the property via a separate SERVICE call first and
-# hardcode the returned IRI into the UNION.
+# A naive SERVICE-resolved variant is NOT viable: resolving "spouse" once
+# via SERVICE and reusing that single variable predicate across both
+# branches of a two-direction UNION triggers the same unbound-predicate-
+# object hazard as CQ9, even when the whole SERVICE+UNION cluster is
+# isolated into its own subquery per CQ9's fix (confirmed: still hits the
+# 30s timeout). The fix, confirmed working: resolve "spouse" *separately
+# per UNION branch*, each into its own variable (?spouseProp1/
+# ?spouseProp2, the CQ7 pattern of resolving one phrase twice), with each
+# branch's SERVICE+join isolated in its own subquery (the CQ9 pattern).
+# Repeat resolution of an already-seen phrase is cache-fast, not a second
+# LLM round trip.
 #################################################################
 
 ex:CQ11 a unit:CompetencyQuestionVerification ;
@@ -555,6 +586,37 @@ PREFIX wdt: <http://www.wikidata.org/prop/direct/>
 SELECT ?spouseLabel WHERE {
   ?item rdfs:label "Cecilia Ștefănescu"@en .
   { ?item wdt:P26 ?spouse } UNION { ?spouse wdt:P26 ?item }
+  ?spouse rdfs:label ?spouseLabel . FILTER(LANG(?spouseLabel) = "en")
+}
+""" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+
+SELECT ?spouseLabel WHERE {
+  # "spouse" resolved separately per branch, into its own variable, each
+  # isolated in its own subquery -- see the header comment above. Sharing
+  # one SERVICE-bound variable across both UNION branches is the hazard;
+  # this sidesteps it.
+  {
+    SELECT ?spouse WHERE {
+      SERVICE <http://localhost:7002/sparql> {
+        [] mwapi:search "spouse" ; mwapi:type "property" ; mwapi:bind ?spouseProp1 .
+      }
+      ?item rdfs:label "Cecilia Ștefănescu"@en .
+      ?item ?spouseProp1 ?spouse .
+    }
+  }
+  UNION
+  {
+    SELECT ?spouse WHERE {
+      SERVICE <http://localhost:7002/sparql> {
+        [] mwapi:search "spouse" ; mwapi:type "property" ; mwapi:bind ?spouseProp2 .
+      }
+      ?item rdfs:label "Cecilia Ștefănescu"@en .
+      ?spouse ?spouseProp2 ?item .
+    }
+  }
   ?spouse rdfs:label ?spouseLabel . FILTER(LANG(?spouseLabel) = "en")
 }
 """ .
