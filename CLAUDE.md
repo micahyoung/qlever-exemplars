@@ -179,6 +179,8 @@ SELECT ?person ?personLabel WHERE {
 }
 ```
 
+⚠️ **A second, distinct hazard: when a query has 2+ SERVICE-bound-predicate triples that share a join variable, and neither triple is otherwise constrained by an already-bound subject/object, QLever's planner can defer each triple's cheap predicate-equality filter (matching the actual resolved P-id) until *after* cross-joining their independently-unconstrained scans together.** Each such triple's `IndexScan` gets estimated at roughly the size of the entire dataset — QLever can't know the SERVICE call will bind only one specific predicate until it actually runs — so joining two of them via a shared variable before either equality filter applies produces a combinatorial blowup (confirmed: a 322M+-row intermediate join, then a 44.5 GB allocation attempt against a 20 GB budget, on a query that returns 15 rows). Fix: isolate one of the triples — together with its own SERVICE call and any other bound constraint, e.g. a type check — inside its own SPARQL subquery: `{ SELECT ?var WHERE { SERVICE {...} ; ...other constraints... } }`. This forces QLever to fully evaluate that subquery, applying its predicate-equality filter, before the outer query's other joins get planned, rather than leaving the filter's timing to the cost-based planner's guess. See `exemplars.ttl`'s CQ6 for a worked example with full before/after `runtimeInformation` measurements. This is **not** a universal fix — it only helps when there's a genuine second competing unconstrained scan to avoid cross-joining against; wrapping a single such triple whose only downstream constraint is a range/numeric `FILTER` (not another predicate-equality join) in a subquery does not help, and was measured to make CQ3's population lookup slower, not faster.
+
 **Vocabulary:**
 
 | Input | Meaning |
@@ -208,12 +210,13 @@ qlever start    # runs on port 7001
 qlever stop     # stop when done
 ```
 
-`wikidata-truthy/Qleverfile`'s `[server]` section sets `WARMUP_CMD` to apply the `cache-service-results=true` runtime parameter automatically on every `qlever start` — this is required for the multi-variable SERVICE joins described above to run in milliseconds instead of 90+ seconds (it tells QLever it may treat SERVICE results as stable/cacheable, which skips a query-planner hazard where it otherwise eagerly tries to materialize the *other* side of the join to check if it's small enough to push down, and that eager check itself scans nearly the entire graph when the other side is a fully-unbound triple pattern). If you ever see multi-variable SERVICE joins go slow again, check it's still applied:
+`wikidata-truthy/Qleverfile`'s `[server]` section sets `WARMUP_CMD` to apply the `cache-service-results=true` runtime parameter automatically on every `qlever start` — this is required for the multi-variable SERVICE joins described above to run in milliseconds instead of 90+ seconds (it tells QLever it may treat SERVICE results as stable/cacheable, which skips a query-planner hazard where it otherwise eagerly tries to materialize the *other* side of the join to check if it's small enough to push down, and that eager check itself scans nearly the entire graph when the other side is a fully-unbound triple pattern). Note this does **not** by itself prevent the 2+-SERVICE-bound-predicate-triple hazard described above — that needs the subquery-isolation fix, not just this flag. If you ever see multi-variable SERVICE joins go slow again, check it's still applied:
 
-Separately, QLever's general result cache (`CACHE_MAX_SIZE` in the same `[server]` section) caches *any* HTTP-200 SERVICE response, success or empty alike, keyed on the literal query text — this is why property-search surfaces resolution failures as non-2xx responses rather than empty-but-200 ones (see the tier-3 paragraph above): only a non-2xx response is guaranteed to be retried fresh instead of replaying a stale cached miss.
 ```bash
 curl -s "http://localhost:7001/?cmd=get-settings&access-token=wikidata-truthy" | grep cache-service-results
 ```
+
+Separately, QLever's general result cache (`CACHE_MAX_SIZE` in the same `[server]` section) caches *any* HTTP-200 SERVICE response, success or empty alike, keyed on the literal query text — this is why property-search surfaces resolution failures as non-2xx responses rather than empty-but-200 ones (see the tier-3 paragraph above): only a non-2xx response is guaranteed to be retried fresh instead of replaying a stale cached miss.
 
 ### SPARQL API (HTTP)
 
@@ -222,3 +225,30 @@ curl -s --max-time 30 localhost:7001 \
   --data-urlencode 'query=SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 5' \
   -H 'Accept: application/sparql-results+json'
 ```
+
+### Query timeout
+
+`wikidata-truthy/Qleverfile`'s `[server]` section sets `TIMEOUT = 30s` — QLever's own
+compiled-in default, deliberately *not* raised, so a pathological query plan (e.g. an
+unconstrained variable-predicate scan, or a SERVICE-bound-predicate join that defeats the
+query planner — see the multi-variable SERVICE join note above) fails fast instead of
+grinding for minutes and burning the shared memory/cache budget.
+
+Override per-request with the `timeout` URL parameter — always allowed to go *lower* than
+the server default with no auth, but going *higher* requires `access_token`:
+
+```bash
+# lower — no access token needed
+curl -s localhost:7001 --data-urlencode 'query=...' --data-urlencode 'timeout=5s'
+
+# higher — needs the access token
+curl -s localhost:7001 --data-urlencode 'query=...' \
+  --data-urlencode 'timeout=90s' --data-urlencode 'access_token=wikidata-truthy'
+```
+
+This matters for composed queries that rely on the property-search SERVICE's tier-3
+LLM fallback (see above) — a cache-miss resolution round trip can itself take "several
+seconds to tens of seconds," which combined with the outer query's own execution time can
+exceed the 30s default. If you expect a query to legitimately need longer than 30s (a
+tier-3 cache miss, or a large aggregation), pass a higher `timeout` explicitly rather than
+relying on the server-wide default.

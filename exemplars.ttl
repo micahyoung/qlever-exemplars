@@ -101,6 +101,26 @@ SELECT ?item ?label WHERE {
 
 #################################################################
 # CQ3 — Multi-hop join
+#
+# The SERVICE-resolved variant below is slow (~14-16s cold) but reliably
+# succeeds within the 30s timeout -- this is known and understood, not a
+# regression. Root cause (confirmed via runtimeInformation): "?city
+# ?popProp ?pop" plans as an unconstrained IndexScan (~126M rows, since
+# ?popProp's actual value -- P1082 -- isn't known until the SERVICE call
+# resolves), and the join that filters it down to the real P1082 rows is
+# deferred to a single MultiColumnJoin at the very end, costing a ~9s
+# sort over the full unfiltered scan. This is the same family of problem
+# as CQ6's (a SERVICE-bound predicate's equality filter applied too
+# late), but NOT the same shape CQ6's subquery fix targets: CQ6's fix
+# works by forcing an early predicate-equality join between two
+# *independently huge* unconstrained scans that would otherwise get
+# cross-joined together first. CQ3 only has one such giant scan (its
+# join partner elsewhere in the query is a mere 142 rows), so the cost
+# is linear (one large sort) rather than combinatorial (a cross-join
+# blowup) -- CQ6's subquery-isolation technique was tried here and
+# measured to make it WORSE (30s timeout instead of 14-16s success), so
+# it is deliberately NOT applied. No confirmed fix for this slowness
+# exists yet; treat ~15s as this query's expected cold-cache cost.
 #################################################################
 
 ex:CQ3 a unit:CompetencyQuestionVerification ;
@@ -246,6 +266,32 @@ SELECT DISTINCT ?item ?label ?pop WHERE {
 
 #################################################################
 # CQ6 — Cross-domain fact linking
+#
+# wdt:P1376 ("capital of") is not restricted to sovereign countries --
+# Wikidata also uses it for capitals of states/provinces (e.g. Munich,
+# capital of Bavaria) and historical polities (e.g. Constantinople,
+# capital of the Byzantine Empire). Both query variants below add
+# "?country wdt:P31 wd:Q6256" (instance of country) to exclude those
+# false positives, restricting to real national capitals.
+#
+# In the SERVICE-resolved variant, that check -- together with the
+# "capital of" property's own SERVICE call -- is isolated inside its own
+# SPARQL subquery ("{ SELECT ?city WHERE {...} }"). This is required, not
+# stylistic: a flat (non-subquery) version of the same triples, even
+# correctly ordered, was repeatedly observed to make QLever's planner
+# attempt a catastrophic unconstrained scan/allocation (one measured
+# failure: 44.5 GB attempted against a 20 GB budget, after ~7.5 minutes).
+# The planner can't know in advance that the SERVICE-bound-predicate
+# triple "?city ?capitalOfProp ?country" will only bind one relation
+# (P1376) until it actually runs it -- the same Service::precompute-
+# SiblingResult hazard noted in the Qleverfile WARMUP_CMD comment, just
+# not fully defeated by cache-service-results=true once 3+ SERVICE
+# blocks feed a single join chain. Wrapping it in a subquery forces
+# QLever to fully evaluate and materialize that small, bounded ?city set
+# on its own before planning the outer joins, sidestepping the bad
+# estimate. Verified fast (single HTTP request, no split queries) on
+# this CQ's brewery/1900 case, and on held-out variants swapping in
+# newspapers/1670 and universities/1500.
 #################################################################
 
 ex:CQ6 a unit:CompetencyQuestionVerification ;
@@ -260,6 +306,7 @@ PREFIX wd: <http://www.wikidata.org/entity/>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
 SELECT DISTINCT ?company ?label ?cityLabel ?inception WHERE {
+  ?country wdt:P31 wd:Q6256 .
   ?city wdt:P1376 ?country .
   ?company wdt:P159 ?city .
   ?company wdt:P31 wd:Q131734 .
@@ -271,6 +318,8 @@ SELECT DISTINCT ?company ?label ?cityLabel ?inception WHERE {
 """ ;
     unit:hasSPARQLQueryUnitTest """
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
 
@@ -289,11 +338,20 @@ SELECT DISTINCT ?company ?label ?cityLabel ?inception WHERE {
        mwapi:bindItem ?breweryClass .
   }
   SERVICE <http://localhost:7002/sparql> {
-    [] mwapi:search "capital of" ; mwapi:type "property" ; mwapi:bind ?capitalOfProp .
     [] mwapi:search "headquarters location" ; mwapi:type "property" ; mwapi:bind ?hqProp .
     [] mwapi:search "inception" ; mwapi:type "property" ; mwapi:bind ?inceptionProp .
   }
-  ?city ?capitalOfProp ?country .
+  # Isolated in its own subquery -- see the CQ6 header comment above for
+  # why this is required, not just stylistic.
+  {
+    SELECT ?city WHERE {
+      SERVICE <http://localhost:7002/sparql> {
+        [] mwapi:search "capital of" ; mwapi:type "property" ; mwapi:bind ?capitalOfProp .
+      }
+      ?country wdt:P31 wd:Q6256 .
+      ?city ?capitalOfProp ?country .
+    }
+  }
   ?company ?hqProp ?city .
   ?company ?inceptionProp ?inception .
   FILTER(?inception < "1900-01-01T00:00:00"^^xsd:dateTime)

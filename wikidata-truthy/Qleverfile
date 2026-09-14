@@ -25,7 +25,7 @@ ACCESS_TOKEN                = wikidata-truthy
 MEMORY_FOR_QUERIES          = 20G
 CACHE_MAX_SIZE              = 15G
 CACHE_MAX_SIZE_SINGLE_ENTRY = 5G
-TIMEOUT                     = 600s
+TIMEOUT                     = 30s
 # Without this, a SPARQL query that joins a SERVICE-resolved predicate AND a
 # SERVICE-resolved object into the same triple (e.g. the property-search
 # SERVICE's mwapi:searchRelation idiom) can trigger a QLever query-planner
