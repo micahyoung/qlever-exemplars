@@ -1,0 +1,266 @@
+@prefix unit:  <https://w3id.org/OWLunit/ontology/> .
+@prefix ex:    <https://example.org/qlever/wikidata-truthy/cq/> .
+@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:   <http://www.w3.org/2002/07/owl#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+
+#################################################################
+# Ontology / dataset under test
+#
+# Known query-planner pathologies in the property-search SERVICE +
+# QLever composition described in CLAUDE.md. Each hazard here is its
+# own competency-question-style exemplar: the CQ text states what
+# fails and why ("[hazard] ..."), and the query is the confirmed
+# PATHOLOGICAL form -- it is expected to fail, not to return results.
+# Working fixes/variants live in exemplars.ttl (CQ4/CQ6/CQ9/CQ10/
+# CQ11/CQ12), cross-referenced from each hazard below.
+#################################################################
+
+ex:HazardsDataset a owl:Ontology ;
+    rdfs:label "Wikidata truthy (QLever local endpoint) -- SERVICE composition hazards" .
+
+#################################################################
+# Hazard 1 -- Joint relation pair feeding an unconstrained-subject triple
+#
+# A single mwapi:searchRelation call binds BOTH ?awardProp and
+# ?nobelPhysics from one SERVICE result. When both feed the same
+# triple and that triple's subject (?person) isn't constrained
+# anywhere else in the query, QLever can't push the equality filter
+# down before planning the join -- it chooses a plan that attempts a
+# multi-GB allocation instead of a cheap indexed lookup.
+#
+# Fix: issue the relation lookup as two separate identical SERVICE
+# calls, one per output variable (cache-fast repeat lookup, not a
+# second LLM round trip). See exemplars.ttl's CQ4 and CQ6.
+#################################################################
+
+ex:Hazard1 a unit:CompetencyQuestionVerification ;
+    rdfs:label "Hazard 1 - Joint relation pair feeding an unconstrained-subject triple" ;
+    unit:testsOntology ex:HazardsDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "[hazard] Who received the Nobel Prize in Physics, resolved via a single joint mwapi:searchRelation call whose property and item both feed one unconstrained-subject triple?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+
+SELECT ?person ?personLabel WHERE {
+  # PATHOLOGICAL: ?awardProp and ?nobelPhysics both come from the SAME
+  # SERVICE call and both feed ?person's single triple below, with
+  # ?person otherwise unconstrained. QLever cannot defer choosing an
+  # index-scan strategy until the SERVICE result materializes, so it
+  # plans a full-dataset join instead of an indexed lookup.
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:searchRelation "received the Nobel Prize in Physics" ;
+       mwapi:bindProperty ?awardProp ;
+       mwapi:bindItem ?nobelPhysics .
+  }
+  ?person ?awardProp ?nobelPhysics .
+  ?person rdfs:label ?personLabel . FILTER(LANG(?personLabel)="en")
+}
+""" ;
+    rdfs:comment "Confirmed failing 2026-09-13: HTTP 500, exception \"Tried to allocate 65.5 GB, but only 20 GB were available\", top-level plan operation \"Join on ?person\". Working fix (per-variable split into two identical SERVICE calls): exemplars.ttl CQ4, CQ6." .
+
+#################################################################
+# Hazard 2 -- SERVICE-bound-predicate object feeding a further join, unisolated
+#
+# Resolving a property via SERVICE, then joining the triple's OBJECT
+# into a further plain (non-SERVICE-bound) triple -- e.g. resolving
+# "place of death" then looking up that place's rdfs:label -- can make
+# QLever plan the SERVICE-bound triple as an unbound-predicate scan of
+# the whole dataset, deferring the already-known predicate-equality
+# filter until after joining against the other large scan. Not
+# specific to OPTIONAL.
+#
+# Fix: isolate the SERVICE-bound-predicate triple alone (not its
+# downstream join) in its own subquery. See exemplars.ttl's CQ9.
+#################################################################
+
+ex:Hazard2 a unit:CompetencyQuestionVerification ;
+    rdfs:label "Hazard 2 - SERVICE-bound-predicate object feeding a further join, unisolated" ;
+    unit:testsOntology ex:HazardsDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "[hazard] When was Lise Meitner born, and where did she die -- resolved with the death-place lookup joined directly to its label instead of isolated in its own subquery?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+
+SELECT ?item ?label ?birth ?deathPlaceLabel WHERE {
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:search "date of birth" ; mwapi:type "property" ; mwapi:bind ?birthProp .
+  }
+  ?item rdfs:label "Lise Meitner"@en .
+  ?item wdt:P31 wd:Q5 ; ?birthProp ?birth ; rdfs:label ?label .
+  # PATHOLOGICAL: ?deathProp is SERVICE-bound, and its object ?deathPlace
+  # joins straight into a plain rdfs:label lookup in the SAME OPTIONAL
+  # block -- no subquery isolation. Compare to exemplars.ttl's CQ9, which
+  # isolates { SELECT ?item ?deathPlace WHERE { SERVICE {...} ; ?item
+  # ?deathProp ?deathPlace . } } before joining the label lookup.
+  OPTIONAL {
+    SERVICE <http://localhost:7002/sparql> {
+      [] mwapi:search "place of death" ; mwapi:type "property" ; mwapi:bind ?deathProp .
+    }
+    ?item ?deathProp ?deathPlace .
+    ?deathPlace rdfs:label ?deathPlaceLabel . FILTER(LANG(?deathPlaceLabel)="en")
+  }
+  FILTER(LANG(?label) = "en")
+}
+""" ;
+    rdfs:comment "Confirmed failing 2026-09-13: HTTP 429, exception \"Operation timed out. Last operation: Sort (internal order) on ?deathProp\", top-level plan operation \"OptionalJoin on ?item\". Working fix (isolate the SERVICE-bound triple in its own subquery): exemplars.ttl CQ9." .
+
+#################################################################
+# Hazard 3a -- Joint relation pair inside FILTER NOT EXISTS, even subquery-isolated
+#
+# mwapi:searchRelation's jointly-bound property+item pair triggers the
+# same unbound-predicate-object scan as Hazard 1 when used inside
+# FILTER NOT EXISTS/MINUS -- even when the triple is isolated in its
+# own subquery per Hazard 2's fix. Isolation only helps when the
+# isolated triple feeds a further JOIN; it does not help when that
+# triple is instead the operand of a set-difference.
+#
+# Fix: don't resolve the pair jointly. Resolve the property alone via
+# plain mwapi:search/mwapi:bind, resolve the item via a direct
+# rdfs:label exact-match instead of mwapi:searchRelation, and isolate
+# that single-variable SERVICE+join in its own subquery. See
+# exemplars.ttl's CQ10.
+#################################################################
+
+ex:Hazard3a a unit:CompetencyQuestionVerification ;
+    rdfs:label "Hazard 3a - Joint relation pair inside FILTER NOT EXISTS, even subquery-isolated" ;
+    unit:testsOntology ex:HazardsDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "[hazard] Which mountains in Bhutan have no recorded first ascent, resolved with the significant-event/first-ascent pair jointly bound via mwapi:searchRelation inside a subquery-isolated FILTER NOT EXISTS?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+
+SELECT ?item ?label WHERE {
+  ?item wdt:P31 wd:Q8502 ;
+        wdt:P17 wd:Q917 ;
+        rdfs:label ?label .
+  FILTER(LANG(?label) = "en")
+  # PATHOLOGICAL: ?eventProp and ?firstAscent both come from ONE
+  # mwapi:searchRelation call. Even fully isolated in its own subquery
+  # (Hazard 2's normal fix), the joint two-variable binding still
+  # triggers a full-scale unbound-predicate-object scan here, because
+  # the isolated triple is the operand of a set-difference (NOT
+  # EXISTS), not a further join -- isolation doesn't help that shape.
+  FILTER NOT EXISTS {
+    SELECT ?item WHERE {
+      SERVICE <http://localhost:7002/sparql> {
+        [] mwapi:searchRelation "achieved the first ascent" ;
+           mwapi:bindProperty ?eventProp ;
+           mwapi:bindItem ?firstAscent .
+      }
+      ?item ?eventProp ?firstAscent .
+    }
+  }
+}
+""" ;
+    rdfs:comment "Confirmed failing 2026-09-13: HTTP 500, exception \"Tried to allocate 65.5 GB, but only 20 GB were available\", top-level plan operation is the FILTER NOT EXISTS subquery itself (planner cannot push down a strategy before the joint SERVICE result materializes). Working fix (resolve property via plain mwapi:search, item via rdfs:label, isolate in a subquery): exemplars.ttl CQ10." .
+
+#################################################################
+# Hazard 3b -- Joint relation pair (or shared single-variable predicate) inside a direction-UNION, even isolated
+#
+# The same unbound-predicate-object scan as Hazard 3a, triggered
+# instead by reusing ONE SERVICE-bound predicate variable across both
+# branches of a UNION over subject/object direction (for a symmetric
+# relation like spouse), even when the whole SERVICE+UNION cluster is
+# isolated into its own subquery.
+#
+# Fix: resolve the property SEPARATELY per UNION branch, each into its
+# own variable, each isolated in its own subquery. See exemplars.ttl's
+# CQ11.
+#################################################################
+
+ex:Hazard3b a unit:CompetencyQuestionVerification ;
+    rdfs:label "Hazard 3b - Shared SERVICE-bound predicate reused across a direction-UNION, even isolated" ;
+    unit:testsOntology ex:HazardsDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "[hazard] Who is Cecilia Ștefănescu's spouse, resolved with one SERVICE-bound predicate variable reused across both directions of a subject/object UNION, isolated in its own subquery?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+
+SELECT ?spouseLabel WHERE {
+  # PATHOLOGICAL: ?spouseProp is resolved ONCE and reused in BOTH
+  # UNION branches below, even though the whole cluster is isolated in
+  # its own subquery per Hazard 2's fix. Compare to exemplars.ttl's
+  # CQ11, which resolves "spouse" into two SEPARATE variables
+  # (?spouseProp1/?spouseProp2), one isolated subquery per branch.
+  {
+    SELECT ?item ?spouse WHERE {
+      SERVICE <http://localhost:7002/sparql> {
+        [] mwapi:search "spouse" ; mwapi:type "property" ; mwapi:bind ?spouseProp .
+      }
+      ?item rdfs:label "Cecilia Ștefănescu"@en .
+      { ?item ?spouseProp ?spouse } UNION { ?spouse ?spouseProp ?item }
+    }
+  }
+  ?spouse rdfs:label ?spouseLabel . FILTER(LANG(?spouseLabel) = "en")
+}
+""" ;
+    rdfs:comment "Confirmed failing 2026-09-13: HTTP 429, exception \"Operation timed out. Last operation: Sort (internal order) on ?item\", top-level plan operation \"Join on ?spouse\". Working fix (resolve the property separately per UNION branch, each isolated): exemplars.ttl CQ11." .
+
+#################################################################
+# Hazard 4 -- Two independent relation pairs, each split per Hazard 1's fix, joined on a shared unconstrained subject
+#
+# More severe than Hazard 1: two DIFFERENT mwapi:searchRelation pairs
+# (different phrases, different properties/items), each individually
+# split into per-variable calls per Hazard 1's fix, still time out if
+# their triples are joined only by sharing the same unconstrained
+# subject variable. The per-variable split only helps within one
+# relation's own two output variables, not across two unrelated
+# relations sharing a subject.
+#
+# Fix: don't resolve either side as a joint property+item pair at all.
+# Resolve the SHARED property once via plain mwapi:search/mwapi:bind,
+# and resolve each item via a direct rdfs:label exact-match instead of
+# mwapi:searchRelation. See exemplars.ttl's CQ12.
+#################################################################
+
+ex:Hazard4 a unit:CompetencyQuestionVerification ;
+    rdfs:label "Hazard 4 - Two independent relation pairs, each split, joined on a shared subject" ;
+    unit:testsOntology ex:HazardsDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "[hazard] Which people have received both the Copley Medal and the Nobel Prize in Chemistry, resolved with two independent mwapi:searchRelation pairs -- each individually split per Hazard 1's fix -- joined only by a shared unconstrained ?person?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+
+SELECT ?person ?personLabel WHERE {
+  # PATHOLOGICAL: both relations are ALREADY split into per-variable
+  # calls (Hazard 1's fix, applied correctly to each relation
+  # individually) -- but the two relations are still joined only by
+  # sharing the unconstrained ?person variable, which is a distinct,
+  # more severe hazard the per-relation split does not cover.
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:searchRelation "received the Copley Medal" ;
+       mwapi:bindProperty ?awardProp1 ;
+       mwapi:bindItem ?copleyA .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:searchRelation "received the Copley Medal" ;
+       mwapi:bindProperty ?awardProp1B ;
+       mwapi:bindItem ?copley .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:searchRelation "received the Nobel Prize in Chemistry" ;
+       mwapi:bindProperty ?awardProp2 ;
+       mwapi:bindItem ?nobelChemA .
+  }
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:searchRelation "received the Nobel Prize in Chemistry" ;
+       mwapi:bindProperty ?awardProp2B ;
+       mwapi:bindItem ?nobelChem .
+  }
+  ?person ?awardProp1 ?copley .
+  ?person ?awardProp2 ?nobelChem .
+  ?person rdfs:label ?personLabel . FILTER(LANG(?personLabel)="en")
+}
+""" ;
+    rdfs:comment "Confirmed failing 2026-09-13: HTTP 429, exception \"Operation timed out. Last operation: Sort (internal order) on ?person\", top-level plan operation \"Join on ?awardProp2\". Working fix (resolve the shared property once via plain mwapi:search, resolve each item via rdfs:label): exemplars.ttl CQ12." .
