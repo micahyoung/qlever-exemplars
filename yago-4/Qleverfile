@@ -1,0 +1,44 @@
+# Qleverfile for YAGO 4.6, use with https://github.com/ad-freiburg/qlever-control
+#
+# qlever get-data  # downloads 6 zip files (each containing one .ttl file), ~10 GB total
+# qlever index     # builds the index
+# qlever start     # starts the server
+
+# NOTE concerning GET_DATA_CMD: this is the "full" scope of YAGO 4.6, i.e. it
+# includes both the facts/labels for entities with an English Wikipedia page
+# and the "beyond-wikipedia" facts/labels for entities without one. Excluded:
+# the fact-log/range-log/taxonomy-log files (logs of statements that were
+# excluded from the KB, not part of it), yago-4.6-tiny.zip (a small demo
+# subset), and yago-entities.jsonl.zip (JSON Lines, not RDF).
+#
+# NOTE concerning meta: yago-4.6-meta.zip is deliberately NOT downloaded here.
+# It contains RDF-star fact annotations (quoted-triple subjects, e.g.
+# "<< yago:X schema:child yago:Y >> schema:startDate ...") -- the YAGO
+# team's own 07-export.sh notes this file is NOT fed into their production
+# QLever instance because "QLever cannot parse" it. If needed later, fetch
+# and index it separately in isolation before deciding whether to fold it in.
+
+[data]
+NAME         = yago-4
+GET_DATA_CMD = curl --location --continue-at - --remote-name-all https://yago-knowledge.org/data/yago4.6/yago-4.6-schema.zip https://yago-knowledge.org/data/yago4.6/yago-4.6-taxonomy.zip https://yago-knowledge.org/data/yago4.6/yago-4.6-facts.zip https://yago-knowledge.org/data/yago4.6/yago-4.6-beyond-wikipedia.zip https://yago-knowledge.org/data/yago4.6/yago-4.6-labels.zip https://yago-knowledge.org/data/yago4.6/yago-4.6-beyond-wikipedia-labels.zip
+DESCRIPTION  = "Full dump from https://yago-knowledge.org/data/yago4.6/, YAGO 4.6"
+
+[index]
+INPUT_FILES        = yago-4.6-*.zip
+CAT_INPUT_FILES    = ( unzip -p yago-4.6-schema.zip; unzip -p yago-4.6-taxonomy.zip; unzip -p yago-4.6-facts.zip; unzip -p yago-4.6-beyond-wikipedia.zip; unzip -p yago-4.6-labels.zip; unzip -p yago-4.6-beyond-wikipedia-labels.zip )
+SETTINGS_JSON      = { "languages-internal": ["en"], "locale": { "language": "en", "country": "US", "ignore-punctuation": true }, "ascii-prefixes-only": false, "num-triples-per-batch": 5000000 }
+STXXL_MEMORY       = 28G
+
+[server]
+PORT                        = 9004
+ACCESS_TOKEN                = yago-4
+MEMORY_FOR_QUERIES          = 10G
+CACHE_MAX_SIZE              = 5G
+CACHE_MAX_SIZE_SINGLE_ENTRY = 2G
+TIMEOUT                     = 30s
+
+[runtime]
+SYSTEM = native
+
+[ui]
+UI_CONFIG = yago-4
