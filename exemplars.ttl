@@ -49,30 +49,15 @@ SELECT ?item ?label ?birth ?death WHERE {
     [] mwapi:search "date of birth" ; mwapi:type "property" ; mwapi:bind ?birthProp .
     [] mwapi:search "date of death" ; mwapi:type "property" ; mwapi:bind ?deathProp .
   }
-  # Isolated in its own subquery, same technique as CQ6: the label-match ->
-  # instance-of-human check resolves ?item to a single row before the outer
-  # query's joins are planned. Without this, "?item ?instanceOfProp
-  # ?humanItem" gets planned as an unconstrained scan (confirmed: estimated
-  # at the full dataset size, cancelled after 5.46 BILLION rows at the 30s
-  # timeout) even though ?item is already down to one candidate from the
-  # label match -- QLever's planner doesn't push that constraint in first.
-  # A single mwapi:searchRelation call suffices here (unlike the two-calls
-  # -one-per-hop pattern in CQ7/CQ8): the hazard this avoids is the query
-  # planner's join order around the unconstrained scan, not anything about
-  # reusing one SERVICE result across two different triples.
-  {
-    SELECT ?item WHERE {
-      SERVICE <http://localhost:7002/sparql> {
-        [] mwapi:searchRelation "instance of human" ;
-           mwapi:bindProperty ?instanceOfProp ;
-           mwapi:bindItem ?humanItem .
-      }
-      { ?item rdfs:label "Marie Curie"@en }
-      UNION
-      { ?item rdfs:label "Marie Sklodowska-Curie"@en }
-      ?item ?instanceOfProp ?humanItem .
-    }
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:searchRelation "instance of human" ;
+       mwapi:bindProperty ?instanceOfProp ;
+       mwapi:bindItem ?humanItem .
   }
+  { ?item rdfs:label "Marie Curie"@en }
+  UNION
+  { ?item rdfs:label "Marie Sklodowska-Curie"@en }
+  ?item ?instanceOfProp ?humanItem .
   ?item ?birthProp ?birth ;
         rdfs:label ?label .
   OPTIONAL { ?item ?deathProp ?death }
@@ -107,25 +92,16 @@ SELECT ?item ?label WHERE {
 #################################################################
 # CQ3 — Multi-hop join
 #
-# The SERVICE-resolved variant below is slow (~14-16s cold) but reliably
-# succeeds within the 30s timeout -- this is known and understood, not a
-# regression. Root cause (confirmed via runtimeInformation): "?city
-# ?popProp ?pop" plans as an unconstrained IndexScan (~126M rows, since
-# ?popProp's actual value -- P1082 -- isn't known until the SERVICE call
-# resolves), and the join that filters it down to the real P1082 rows is
-# deferred to a single MultiColumnJoin at the very end, costing a ~9s
-# sort over the full unfiltered scan. This is the same family of problem
-# as CQ6's (a SERVICE-bound predicate's equality filter applied too
-# late), but NOT the same shape CQ6's subquery fix targets: CQ6's fix
-# works by forcing an early predicate-equality join between two
-# *independently huge* unconstrained scans that would otherwise get
-# cross-joined together first. CQ3 only has one such giant scan (its
-# join partner elsewhere in the query is a mere 142 rows), so the cost
-# is linear (one large sort) rather than combinatorial (a cross-join
-# blowup) -- CQ6's subquery-isolation technique was tried here and
-# measured to make it WORSE (30s timeout instead of 14-16s success), so
-# it is deliberately NOT applied. No confirmed fix for this slowness
-# exists yet; treat ~15s as this query's expected cold-cache cost.
+# The SERVICE-resolved variant is noticeably slower (~15s cold) than the
+# hardcoded one, but comfortably inside the 30s timeout -- this is a known,
+# accepted cost, not a bug. "?city ?popProp ?pop" can't be narrowed to the
+# real "population" property (P1082) until the SERVICE call resolves it,
+# so QLever scans broadly first and filters afterwards, instead of the
+# other way around.
+#
+# Subquery isolation (see CQ9) doesn't help here: "?city ?popProp ?pop"'s
+# downstream constraint is a numeric FILTER, not another join, so there's
+# no competing scan to avoid cross-joining against.
 #################################################################
 
 ex:CQ3 a unit:CompetencyQuestionVerification ;
@@ -204,12 +180,12 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
 
 SELECT ?countryLabel (COUNT(DISTINCT ?person) AS ?count) WHERE {
-  # mwapi:searchRelation, split across two calls, one per output variable
-  # (see the ⚠️ warning on this in CLAUDE.md's SERVICE syntax reference):
-  # binding both from a single call into one unconstrained-subject triple
-  # was found to make QLever's planner choose a catastrophic plan. Joint
-  # context here also disambiguates "award received" from the individually
-  # -plausible "nominated for".
+  # mwapi:searchRelation, split into two identical calls, one per output
+  # variable: a single call binding both ?awardProp and ?nobelPhysics into
+  # the same triple can make QLever's planner choose a catastrophic plan
+  # (see CLAUDE.md's SERVICE syntax reference for the general rule). The
+  # joint phrase here also disambiguates "award received" from the
+  # individually-plausible "nominated for".
   SERVICE <http://localhost:7002/sparql> {
     [] mwapi:searchRelation "received the Nobel Prize in Physics" ;
        mwapi:bindProperty ?awardProp ;
@@ -276,29 +252,11 @@ SELECT DISTINCT ?item ?label ?pop WHERE {
 # CQ6 — Cross-domain fact linking
 #
 # wdt:P1376 ("capital of") is not restricted to sovereign countries --
-# Wikidata also uses it for capitals of states/provinces (e.g. Munich,
-# capital of Bavaria) and historical polities (e.g. Constantinople,
-# capital of the Byzantine Empire). Both query variants below add
-# "?country wdt:P31 wd:Q6256" (instance of country) to exclude those
-# false positives, restricting to real national capitals.
-#
-# In the SERVICE-resolved variant, that check -- together with the
-# "capital of" property's own SERVICE call -- is isolated inside its own
-# SPARQL subquery ("{ SELECT ?city WHERE {...} }"). This is required, not
-# stylistic: a flat (non-subquery) version of the same triples, even
-# correctly ordered, was repeatedly observed to make QLever's planner
-# attempt a catastrophic unconstrained scan/allocation (one measured
-# failure: 44.5 GB attempted against a 20 GB budget, after ~7.5 minutes).
-# The planner can't know in advance that the SERVICE-bound-predicate
-# triple "?city ?capitalOfProp ?country" will only bind one relation
-# (P1376) until it actually runs it -- a Service::precomputeSiblingResult
-# hazard that persists once 3+ SERVICE blocks feed a single join chain,
-# independent of any QLever runtime parameter. Wrapping it in a subquery forces
-# QLever to fully evaluate and materialize that small, bounded ?city set
-# on its own before planning the outer joins, sidestepping the bad
-# estimate. Verified fast (single HTTP request, no split queries) on
-# this CQ's brewery/1900 case, and on held-out variants swapping in
-# newspapers/1670 and universities/1500.
+# Wikidata also uses it for capitals of states/provinces (e.g. Munich is
+# "capital of" Bavaria) and historical polities (e.g. Constantinople was
+# "capital of" the Byzantine Empire). Both query variants add a type check,
+# "?country wdt:P31 wd:Q6256" (instance of country), to exclude those false
+# positives and keep only real national capitals.
 #################################################################
 
 ex:CQ6 a unit:CompetencyQuestionVerification ;
@@ -331,10 +289,11 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
 
 SELECT DISTINCT ?company ?label ?cityLabel ?inception WHERE {
-  # mwapi:searchRelation, split across two calls, one per output variable
-  # (see the ⚠️ warning on this in CLAUDE.md's SERVICE syntax reference).
-  # Unlike CQ3, ?company ?instanceOfProp ?breweryClass is a direct triple,
-  # so the relation form's live-verification applies cleanly here.
+  # mwapi:searchRelation, split into two identical calls, one per output
+  # variable -- same reason as CQ4 (see CLAUDE.md's SERVICE syntax
+  # reference). Unlike CQ3, "?company ?instanceOfProp ?breweryClass" is a
+  # direct triple here, so the relation form's live-verification applies
+  # cleanly.
   SERVICE <http://localhost:7002/sparql> {
     [] mwapi:searchRelation "instance of brewery" ;
        mwapi:bindProperty ?instanceOfProp ;
@@ -349,17 +308,11 @@ SELECT DISTINCT ?company ?label ?cityLabel ?inception WHERE {
     [] mwapi:search "headquarters location" ; mwapi:type "property" ; mwapi:bind ?hqProp .
     [] mwapi:search "inception" ; mwapi:type "property" ; mwapi:bind ?inceptionProp .
   }
-  # Isolated in its own subquery -- see the CQ6 header comment above for
-  # why this is required, not just stylistic.
-  {
-    SELECT ?city WHERE {
-      SERVICE <http://localhost:7002/sparql> {
-        [] mwapi:search "capital of" ; mwapi:type "property" ; mwapi:bind ?capitalOfProp .
-      }
-      ?country wdt:P31 wd:Q6256 .
-      ?city ?capitalOfProp ?country .
-    }
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:search "capital of" ; mwapi:type "property" ; mwapi:bind ?capitalOfProp .
   }
+  ?country wdt:P31 wd:Q6256 .
+  ?city ?capitalOfProp ?country .
   ?company ?hqProp ?city .
   ?company ?inceptionProp ?inception .
   FILTER(?inception < "1900-01-01T00:00:00"^^xsd:dateTime)
@@ -372,14 +325,18 @@ SELECT DISTINCT ?company ?label ?cityLabel ?inception WHERE {
 #################################################################
 # CQ7 — Bounded-depth hierarchy traversal, fully dynamic
 #
-# Variant of CQ2 that avoids the wdt:P131+ property-path modifier (which
-# cannot be applied to a SERVICE-resolved variable predicate) by unrolling
-# two explicit hops instead of unbounded recursion. Nothing is hardcoded:
-# the entity is resolved via rdfs:label, and the property is resolved twice
-# via SERVICE (once per hop, under separate variable names) rather than
-# reused across both triples — reusing one SERVICE-bound variable across two
-# index scans defeats QLever's query planner and forces an unconstrained
-# ~65GB scan.
+# Variant of CQ2 that avoids the wdt:P131+ property-path modifier: `+`/`*`
+# can't apply to a SERVICE-resolved variable predicate (QLever rejects
+# "?prop+" as a parse error), so this unrolls two explicit hops instead of
+# one unbounded-recursion triple. Nothing is hardcoded -- the entity
+# resolves via rdfs:label, and "located in the administrative territorial
+# entity" resolves via SERVICE *twice*, once per hop, into two separate
+# variables (?locatedInProp1/?locatedInProp2) rather than reusing one
+# variable across both triples. Reusing a single SERVICE-bound variable
+# across two different index-scan positions is its own unconstrained-scan
+# risk -- resolving it twice, cheaply (repeat resolutions of an
+# already-seen phrase are cache-fast, not a second LLM round trip),
+# sidesteps it.
 #################################################################
 
 ex:CQ7 a unit:CompetencyQuestionVerification ;
@@ -392,10 +349,9 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
 
 SELECT ?regionLabel ?countryLabel WHERE {
-  # mwapi:bind: the same phrase resolved twice into distinct variables
-  # (?locatedInProp1/?locatedInProp2), one round trip -- each hop still
-  # gets its own SPARQL variable, which is what this CQ's header comment
-  # requires.
+  # mwapi:bind: the same phrase resolved twice into distinct variables, one
+  # round trip -- see the header comment above for why each hop needs its
+  # own variable.
   SERVICE <http://localhost:7002/sparql> {
     [] mwapi:search "located in the administrative territorial entity" ; mwapi:type "property" ; mwapi:bind ?locatedInProp1 .
     [] mwapi:search "located in the administrative territorial entity" ; mwapi:type "property" ; mwapi:bind ?locatedInProp2 .
@@ -448,5 +404,75 @@ SELECT ?item ?label ?pop WHERE {
   ?illinois ?capitalProp ?item .
   ?item ?popProp ?pop .
   ?item rdfs:label ?label . FILTER(LANG(?label)="en")
+}
+""" .
+
+#################################################################
+# CQ9 — SERVICE-bound predicate whose object feeds a further join
+#
+# A SERVICE-bound-predicate triple whose object joins into a plain
+# (non-SERVICE-bound) triple -- here, resolving "place of death" then
+# looking up that place's rdfs:label -- can make QLever plan the triple
+# as an unbound-predicate scan of the whole dataset instead of pushing
+# down the already-resolved equality filter, then join that against the
+# other large scan. Hangs to the timeout; not specific to OPTIONAL.
+#
+# Fix: isolate the SERVICE-bound-predicate triple alone (not its
+# downstream join) in its own subquery:
+# { SELECT ?item ?deathPlace WHERE { SERVICE {...} ; ?item ?deathProp
+# ?deathPlace . } }
+#################################################################
+
+ex:CQ9 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ9 - SERVICE-bound predicate object feeding a further join" ;
+    unit:testsOntology ex:WikidataTruthyDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "When was Lise Meitner born, and where did she die?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+
+SELECT ?item ?label ?birth ?deathPlaceLabel WHERE {
+  ?item rdfs:label "Lise Meitner"@en .
+  ?item wdt:P31 wd:Q5 ;
+        wdt:P569 ?birth ;
+        rdfs:label ?label .
+  OPTIONAL {
+    ?item wdt:P20 ?deathPlace .
+    ?deathPlace rdfs:label ?deathPlaceLabel . FILTER(LANG(?deathPlaceLabel)="en")
+  }
+  FILTER(LANG(?label) = "en")
+}
+""" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+
+SELECT ?item ?label ?birth ?deathPlaceLabel WHERE {
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:search "date of birth" ; mwapi:type "property" ; mwapi:bind ?birthProp .
+  }
+  ?item rdfs:label "Lise Meitner"@en .
+  ?item wdt:P31 wd:Q5 ;
+        ?birthProp ?birth ;
+        rdfs:label ?label .
+  # Subquery isolation required here -- see the header comment above.
+  # Without it, "?item ?deathProp ?deathPlace" plans as an
+  # unbound-predicate scan joined to the label lookup and hangs.
+  OPTIONAL {
+    {
+      SELECT ?item ?deathPlace WHERE {
+        SERVICE <http://localhost:7002/sparql> {
+          [] mwapi:search "place of death" ; mwapi:type "property" ; mwapi:bind ?deathProp .
+        }
+        ?item ?deathProp ?deathPlace .
+      }
+    }
+    ?deathPlace rdfs:label ?deathPlaceLabel . FILTER(LANG(?deathPlaceLabel)="en")
+  }
+  FILTER(LANG(?label) = "en")
 }
 """ .
