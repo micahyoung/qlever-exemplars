@@ -46,7 +46,7 @@ rm -f wikidata-truthy.* wikidata-truthy.internal.index.*
 ## Querying
 
 **SERVICE is the default for resolving predicates from natural language.**
-Never probe predicate frequencies to discover properties — SERVICE handles exact matches (pinned first, and preferred over any looser alias match — see below) for `mwapi:type "property"`.
+Never probe predicate frequencies to discover properties — SERVICE handles exact matches (pinned first, and preferred over any looser alias match — see below) for `mwapi:type "property"`. See `hazards.ttl` (Hazard 7) for the confirmed pathological form (full ~8.2B-triple scan, 30s timeout) and its query plan.
 
 **SERVICE can attempt general entity resolution, but it's best-effort.** `mwapi:type "item"` indexes the ~114k entities that appear as the object of a `P31` ("instance of") triple somewhere in the dataset — i.e. class/type entities like `Q5` (human) or `Q515` (city) — and resolves those instantly. For everything else (e.g. "Marie Curie", "the Big Apple"), it falls back to a tier-3 resolver: an LLM proposes candidate canonical names, each is verified with a **live** exact-match query against QLever itself (not just the precomputed index), and same-labeled candidates are disambiguated by statement count. This is not guaranteed to resolve, and has LLM-round-trip latency (can be several seconds to tens of seconds) on a cache miss — successful resolutions are persisted, so a repeat query for the same phrase becomes an instant exact-match hit.
 
@@ -61,7 +61,7 @@ SELECT ?item ?label WHERE {
 } LIMIT 10
 ```
 
-Never use `FILTER(CONTAINS(?label, "..."))` (or any other unanchored label scan) — it forces a full unindexed scan over the label predicate and will time out, the same way an unconstrained variable-predicate scan does. Use the exact literal match above, then disambiguate candidates (there are often several) with a follow-up query constraining on `P31`/`P131` etc.
+Never use `FILTER(CONTAINS(?label, "..."))` (or any other unanchored label scan) — it forces a full unindexed scan over the label predicate and will time out, the same way an unconstrained variable-predicate scan does. Use the exact literal match above, then disambiguate candidates (there are often several) with a follow-up query constraining on `P31`/`P131` etc. See `hazards.ttl` (Hazard 5) for the confirmed pathological form and its query plan.
 
 ### Step 1: Resolve
 
@@ -89,7 +89,7 @@ SELECT ?prop ?propLabel ?propScore ?entity ?entityLabel ?entityScore WHERE {
 
 ### Step 2: Compose
 
-Plug resolved P-id and Q-id into the final query. Use `*` (zero-or-more) on `P131` — administrative hierarchies are rarely flat. **Always constrain the subject** (a `VALUES` list or a `P31` type filter); an unconstrained variable-predicate scan can take 90+ seconds and crash QLever.
+Plug resolved P-id and Q-id into the final query. Use `*` (zero-or-more) on `P131` — administrative hierarchies are rarely flat. **Always constrain the subject** (a `VALUES` list or a `P31` type filter); an unconstrained variable-predicate scan can take 90+ seconds and crash QLever. See `hazards.ttl` (Hazard 6) for the confirmed pathological form and its query plan.
 
 ```sparql
 PREFIX wd:  <http://www.wikidata.org/entity/>

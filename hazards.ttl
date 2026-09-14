@@ -8,13 +8,16 @@
 #################################################################
 # Ontology / dataset under test
 #
-# Known query-planner pathologies in the property-search SERVICE +
-# QLever composition described in CLAUDE.md. Each hazard here is its
-# own competency-question-style exemplar: the CQ text states what
+# Known query-planner pathologies against this QLever endpoint and its
+# property-search SERVICE, described in CLAUDE.md. Each hazard here is
+# its own competency-question-style exemplar: the CQ text states what
 # fails and why ("[hazard] ..."), and the query is the confirmed
 # PATHOLOGICAL form -- it is expected to fail, not to return results.
+# Hazards 1-4 are SERVICE-composition-specific; Hazards 5-7 are plain
+# SPARQL/endpoint pathologies that don't involve SERVICE at all.
 # Working fixes/variants live in exemplars.ttl (CQ4/CQ6/CQ9/CQ10/
-# CQ11/CQ12), cross-referenced from each hazard below.
+# CQ11/CQ12) or CLAUDE.md directly, cross-referenced from each hazard
+# below.
 #################################################################
 
 ex:HazardsDataset a owl:Ontology ;
@@ -264,3 +267,113 @@ SELECT ?person ?personLabel WHERE {
 }
 """ ;
     rdfs:comment "Confirmed failing 2026-09-13: HTTP 429, exception \"Operation timed out. Last operation: Sort (internal order) on ?person\", top-level plan operation \"Join on ?awardProp2\". Working fix (resolve the shared property once via plain mwapi:search, resolve each item via rdfs:label): exemplars.ttl CQ12." .
+
+#################################################################
+# Hazard 5 -- Unanchored label CONTAINS scan
+#
+# FILTER(CONTAINS(?label, "...")) (or any other unanchored substring
+# match on rdfs:label) cannot use the label index for the filter
+# itself: the underlying IndexScan over rdfs:label materializes
+# quickly, but the CONTAINS predicate then has to be evaluated
+# row-by-row over the whole scanned range and never finishes within
+# the query timeout. Not SERVICE-related -- reproduces on a plain
+# query against the QLever endpoint directly.
+#
+# Fix: use an exact-match rdfs:label lookup, then disambiguate
+# candidates with a follow-up query constraining on P31/P131 etc. See
+# CLAUDE.md's entity-resolution guidance.
+#################################################################
+
+ex:Hazard5 a unit:CompetencyQuestionVerification ;
+    rdfs:label "Hazard 5 - Unanchored label CONTAINS scan" ;
+    unit:testsOntology ex:HazardsDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "[hazard] Which items have a label containing \"Gweru\", found via an unanchored FILTER(CONTAINS(...)) scan instead of an exact rdfs:label match?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?item ?label WHERE {
+  # PATHOLOGICAL: CONTAINS() over ?label has no index to use -- the
+  # IndexScan over the label predicate alone materializes fine, but
+  # then every one of those rows has to be substring-matched in a
+  # row-by-row Filter step, which never finishes in time. Compare to
+  # CLAUDE.md's recommended `?item rdfs:label "Gweru"@en` exact match.
+  ?item rdfs:label ?label .
+  FILTER(CONTAINS(?label, "Gweru"))
+}
+""" ;
+    rdfs:comment "Confirmed failing 2026-09-13: HTTP 429, exception \"Operation timed out.\". Plan: IndexScan PSO on rdfs:label materializes 562,500 rows in 22ms (fast), but the subsequent Filter(CONTAINS(?label, \"Gweru\")) step is cancelled after running the full 30s budget without completing. Fix: exact rdfs:label match; see CLAUDE.md's entity-resolution guidance." .
+
+#################################################################
+# Hazard 6 -- Bare unconstrained SERVICE-bound-predicate scan (no downstream join needed)
+#
+# A SERVICE-resolved predicate variable used in a triple whose subject
+# has NO other constraint (no VALUES list, no P31 type filter, no
+# other triple at all) forces a full-dataset predicate-unbound scan --
+# QLever can't push the predicate-equality filter into the index scan
+# because the predicate isn't a literal IRI at plan time, even though
+# it resolves to exactly one concrete value at runtime. This is the
+# same underlying mechanism as Hazard 2, but triggered with NO
+# downstream join at all -- Hazard 2's subquery-isolation fix isn't
+# even applicable here, because there's nothing to isolate FROM.
+#
+# Fix: always constrain the subject with a VALUES list or a P31 type
+# filter, per CLAUDE.md's Step 2 ("Compose") guidance.
+#################################################################
+
+ex:Hazard6 a unit:CompetencyQuestionVerification ;
+    rdfs:label "Hazard 6 - Bare unconstrained SERVICE-bound-predicate scan" ;
+    unit:testsOntology ex:HazardsDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "[hazard] What is the population of every item in the dataset, resolved via SERVICE with the subject left completely unconstrained (no VALUES list, no P31 filter, no other triple)?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+
+SELECT ?item ?val WHERE {
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:search "population" ; mwapi:type "property" ; mwapi:bind ?popProp .
+  }
+  # PATHOLOGICAL: ?item is completely unconstrained -- no VALUES list,
+  # no P31 type filter, no other triple pattern at all. ?popProp
+  # resolves to a single concrete predicate (wdt:P1082) at runtime, but
+  # QLever's planner treats the triple as a full predicate-unbound scan
+  # at plan time regardless.
+  ?item ?popProp ?val .
+}
+""" ;
+    rdfs:comment "Confirmed failing 2026-09-13: HTTP 429, exception \"Operation timed out.\". Plan: IndexScan PSO ?item ?popProp ?val estimates/materializes 5,868,629,401 result rows (essentially the whole ~8.2B-triple dataset) before the Join against the SERVICE-resolved ?popProp value can be applied; top-level plan operation \"Join on ?popProp\", cancelled after the 30s budget. Fix: constrain the subject with a VALUES list or a P31 type filter -- see CLAUDE.md Step 2 (\"Compose\")." .
+
+#################################################################
+# Hazard 7 -- Predicate-frequency probing to discover properties
+#
+# Grouping and counting over every triple in the dataset to discover
+# which predicates exist, or how common they are, requires a full scan
+# of the ~8.2B-triple dataset before GroupBy can even start
+# aggregating -- there's no shortcut, and it never completes within
+# the query timeout. This is why CLAUDE.md says to never probe
+# predicate frequencies this way.
+#
+# Fix: use the property-search SERVICE's mwapi:search / mwapi:type
+# "property" ranked lookup instead -- it's a precomputed index lookup,
+# not a graph scan.
+#################################################################
+
+ex:Hazard7 a unit:CompetencyQuestionVerification ;
+    rdfs:label "Hazard 7 - Predicate-frequency probing to discover properties" ;
+    unit:testsOntology ex:HazardsDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "[hazard] What are the 20 most common predicates in the dataset, found by grouping and counting over every triple instead of using the property-search SERVICE?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?p (COUNT(*) AS ?c) WHERE {
+  # PATHOLOGICAL: no predicate or subject constraint at all -- this
+  # forces a full scan of every triple in the dataset before GroupBy
+  # can even start aggregating. Compare to the property-search
+  # SERVICE's mwapi:search / mwapi:type "property", a precomputed
+  # ranked-index lookup with no graph scan at all.
+  ?s ?p ?o .
+} GROUP BY ?p ORDER BY DESC(?c) LIMIT 20
+""" ;
+    rdfs:comment "Confirmed failing 2026-09-13: HTTP 429, exception \"Operation timed out. Last operation: GroupBy on ?p\". Plan: IndexScan PSO ?p estimates/materializes 5,467,814,050 rows (a full scan of the ~8.2B-triple dataset) before GroupBy can aggregate; cancelled after the 30s budget. Fix: never probe predicate frequencies this way -- use the property-search SERVICE's mwapi:search / mwapi:type \"property\" ranked lookup instead." .
