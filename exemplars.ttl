@@ -42,21 +42,6 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
 
 SELECT ?item ?label ?birth ?death WHERE {
-  # mwapi:searchRelation resolves a "?x is-P Q" pair jointly (here: item is
-  # an instance of "human") instead of two blind lookups -- see the SERVICE
-  # syntax reference in CLAUDE.md. Split into two calls, one per output
-  # variable, per that same reference (a single call binding both into one
-  # triple can defeat QLever's planner); the repeat call is cache-cheap.
-  SERVICE <http://localhost:7002/sparql> {
-    [] mwapi:searchRelation "instance of human" ;
-       mwapi:bindProperty ?instanceOfProp ;
-       mwapi:bindItem ?humanItemA .
-  }
-  SERVICE <http://localhost:7002/sparql> {
-    [] mwapi:searchRelation "instance of human" ;
-       mwapi:bindProperty ?instanceOfPropB ;
-       mwapi:bindItem ?humanItem .
-  }
   # mwapi:bind batches unrelated phrases ("date of birth", "date of death")
   # into one round trip -- no joint-context benefit needed here, just fewer
   # requests.
@@ -64,11 +49,31 @@ SELECT ?item ?label ?birth ?death WHERE {
     [] mwapi:search "date of birth" ; mwapi:type "property" ; mwapi:bind ?birthProp .
     [] mwapi:search "date of death" ; mwapi:type "property" ; mwapi:bind ?deathProp .
   }
-  { ?item rdfs:label "Marie Curie"@en }
-  UNION
-  { ?item rdfs:label "Marie Sklodowska-Curie"@en }
-  ?item ?instanceOfProp ?humanItem ;
-        ?birthProp ?birth ;
+  # Isolated in its own subquery, same technique as CQ6: the label-match ->
+  # instance-of-human check resolves ?item to a single row before the outer
+  # query's joins are planned. Without this, "?item ?instanceOfProp
+  # ?humanItem" gets planned as an unconstrained scan (confirmed: estimated
+  # at the full dataset size, cancelled after 5.46 BILLION rows at the 30s
+  # timeout) even though ?item is already down to one candidate from the
+  # label match -- QLever's planner doesn't push that constraint in first.
+  # A single mwapi:searchRelation call suffices here (unlike the two-calls
+  # -one-per-hop pattern in CQ7/CQ8): the hazard this avoids is the query
+  # planner's join order around the unconstrained scan, not anything about
+  # reusing one SERVICE result across two different triples.
+  {
+    SELECT ?item WHERE {
+      SERVICE <http://localhost:7002/sparql> {
+        [] mwapi:searchRelation "instance of human" ;
+           mwapi:bindProperty ?instanceOfProp ;
+           mwapi:bindItem ?humanItem .
+      }
+      { ?item rdfs:label "Marie Curie"@en }
+      UNION
+      { ?item rdfs:label "Marie Sklodowska-Curie"@en }
+      ?item ?instanceOfProp ?humanItem .
+    }
+  }
+  ?item ?birthProp ?birth ;
         rdfs:label ?label .
   OPTIONAL { ?item ?deathProp ?death }
   FILTER(LANG(?label) = "en")
@@ -199,9 +204,12 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
 
 SELECT ?countryLabel (COUNT(DISTINCT ?person) AS ?count) WHERE {
-  # mwapi:searchRelation, split across two calls (see CQ1). Joint context
-  # here disambiguates "award received" from the individually-plausible
-  # "nominated for".
+  # mwapi:searchRelation, split across two calls, one per output variable
+  # (see the ⚠️ warning on this in CLAUDE.md's SERVICE syntax reference):
+  # binding both from a single call into one unconstrained-subject triple
+  # was found to make QLever's planner choose a catastrophic plan. Joint
+  # context here also disambiguates "award received" from the individually
+  # -plausible "nominated for".
   SERVICE <http://localhost:7002/sparql> {
     [] mwapi:searchRelation "received the Nobel Prize in Physics" ;
        mwapi:bindProperty ?awardProp ;
@@ -283,10 +291,9 @@ SELECT DISTINCT ?item ?label ?pop WHERE {
 # failure: 44.5 GB attempted against a 20 GB budget, after ~7.5 minutes).
 # The planner can't know in advance that the SERVICE-bound-predicate
 # triple "?city ?capitalOfProp ?country" will only bind one relation
-# (P1376) until it actually runs it -- the same Service::precompute-
-# SiblingResult hazard noted in the Qleverfile WARMUP_CMD comment, just
-# not fully defeated by cache-service-results=true once 3+ SERVICE
-# blocks feed a single join chain. Wrapping it in a subquery forces
+# (P1376) until it actually runs it -- a Service::precomputeSiblingResult
+# hazard that persists once 3+ SERVICE blocks feed a single join chain,
+# independent of any QLever runtime parameter. Wrapping it in a subquery forces
 # QLever to fully evaluate and materialize that small, bounded ?city set
 # on its own before planning the outer joins, sidestepping the bad
 # estimate. Verified fast (single HTTP request, no split queries) on
@@ -324,9 +331,10 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
 
 SELECT DISTINCT ?company ?label ?cityLabel ?inception WHERE {
-  # mwapi:searchRelation, split across two calls (see CQ1). Unlike CQ3,
-  # ?company ?instanceOfProp ?breweryClass is a direct triple, so the
-  # relation form's live-verification applies cleanly here.
+  # mwapi:searchRelation, split across two calls, one per output variable
+  # (see the ⚠️ warning on this in CLAUDE.md's SERVICE syntax reference).
+  # Unlike CQ3, ?company ?instanceOfProp ?breweryClass is a direct triple,
+  # so the relation form's live-verification applies cleanly here.
   SERVICE <http://localhost:7002/sparql> {
     [] mwapi:searchRelation "instance of brewery" ;
        mwapi:bindProperty ?instanceOfProp ;

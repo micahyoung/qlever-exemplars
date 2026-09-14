@@ -263,6 +263,33 @@ def _extract_service_body(raw_query):
     return raw_query[start : i - 1]
 
 
+_VALUES_CLAUSE_RE = re.compile(r"VALUES\s*\([^)]*\)\s*\{")
+
+
+def _strip_values_clause(body):
+    """Strip a trailing SPARQL VALUES (...) { ... } clause QLever appends to
+    a SERVICE sub-query when cache-service-results=false, as part of its
+    join-pushdown optimization (it tries to push the other side of the join
+    down into the SERVICE call as a VALUES filter). This clause is not valid
+    Turtle -- our body parser is Turtle-based -- and our resolution logic is
+    phrase-driven and deterministic, so we never need to honor it anyway;
+    just remove it so the rest of the body still parses."""
+    m = _VALUES_CLAUSE_RE.search(body)
+    if not m:
+        return body
+    # brace-depth walk from the matched "{" to find the clause's matching "}",
+    # same technique as _extract_service_body above.
+    depth = 1
+    i = m.end()
+    while i < len(body) and depth:
+        if body[i] == "{":
+            depth += 1
+        elif body[i] == "}":
+            depth -= 1
+        i += 1
+    return body[: m.start()] + body[i:]
+
+
 _SELECT_VARS_RE = re.compile(r"SELECT\s+(.*?)\s*\{", re.IGNORECASE | re.DOTALL)
 
 
@@ -320,6 +347,7 @@ def parse_service_body(raw_query):
     parsed = ParsedService()
     parsed.expected_vars = _extract_expected_vars(raw_query)
     body = _extract_service_body(raw_query)
+    body = _strip_values_clause(body)
     if not body.strip():
         return parsed
 

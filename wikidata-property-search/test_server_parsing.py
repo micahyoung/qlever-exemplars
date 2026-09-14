@@ -95,6 +95,62 @@ def test_extract_service_body_falls_back_to_first_brace_when_no_service_wrapper(
     assert "SELECT" not in body
 
 
+# --- _strip_values_clause ------------------------------------------------------
+
+def test_strip_values_clause_removes_empty_values_block():
+    body = (
+        '\n    [] mwapi:search "headquarters location" ; mwapi:type "property" ; mwapi:bind ?hqProp .\n'
+        '    [] mwapi:search "inception" ; mwapi:type "property" ; mwapi:bind ?inceptionProp .\n'
+        "  \nVALUES (?hqProp) { } \n"
+    )
+    stripped = server._strip_values_clause(body)
+    assert "VALUES" not in stripped
+    assert 'mwapi:search "headquarters location"' in stripped
+    assert 'mwapi:search "inception"' in stripped
+
+
+def test_strip_values_clause_removes_populated_values_block():
+    body = (
+        '[] mwapi:search "population" ; mwapi:bind ?popProp . '
+        "VALUES (?popProp) { (<http://www.wikidata.org/prop/direct/P1082>) }"
+    )
+    stripped = server._strip_values_clause(body)
+    assert "VALUES" not in stripped
+    assert 'mwapi:search "population"' in stripped
+
+
+def test_strip_values_clause_noop_when_absent():
+    body = '[] mwapi:search "inception" ; mwapi:bind ?inceptionProp .'
+    assert server._strip_values_clause(body) == body
+
+
+def test_parse_service_body_tolerates_qlever_values_pushdown():
+    """Regression test for the actual raw request QLever sends when
+    cache-service-results=false: it appends an (empty, in this capture)
+    VALUES (?joinVar) { } clause inside the outer braces as part of its
+    join-pushdown optimization. Turtle has no VALUES construct, so without
+    stripping it, rdflib's Turtle parser used to throw and this SERVICE call
+    would 502. Captured verbatim from a real QLever instance for CQ6's
+    "headquarters location"/"inception" batch call."""
+    query = (
+        "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n"
+        "PREFIX wdt: <http://www.wikidata.org/prop/direct/>\n"
+        "PREFIX wd: <http://www.wikidata.org/entity/>\n"
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n"
+        "PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>\n"
+        "SELECT ?_QLever_internal_variable_2 ?hqProp ?_QLever_internal_variable_3 ?inceptionProp {\n"
+        "\n"
+        '    [] mwapi:search "headquarters location" ; mwapi:type "property" ; mwapi:bind ?hqProp .\n'
+        '    [] mwapi:search "inception" ; mwapi:type "property" ; mwapi:bind ?inceptionProp .\n'
+        "  \n"
+        "VALUES (?hqProp) { } \n"
+        "}"
+    )
+    parsed = server.parse_service_body(query)
+    assert {b["phrase"] for b in parsed.batches} == {"headquarters location", "inception"}
+    assert {b["bind_var"] for b in parsed.batches} == {"hqProp", "inceptionProp"}
+
+
 # --- _extract_expected_vars ---------------------------------------------------
 
 def test_extract_expected_vars_from_qlever_wire_format():

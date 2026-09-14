@@ -160,7 +160,7 @@ SELECT ?person ?personLabel WHERE {
 }
 ```
 
-⚠️ **If a relation pair's two output variables both feed the same triple (as above), and that triple's subject isn't otherwise constrained elsewhere in the query, issue the relation lookup as two separate identical `SERVICE` calls, one per output variable** (see `exemplars.ttl`'s CQ1/CQ4/CQ6 for worked examples) — binding both from a single `SERVICE` result into one unconstrained-subject triple was found to make QLever's query planner choose a catastrophic plan (multi-GB allocation attempt or 60+ second hang), even with the `cache-service-results` fix below applied. The second identical call is cheap: successful relation resolutions are cached by phrase, so it's a near-instant repeat lookup, not a second LLM round trip.
+⚠️ **If a relation pair's two output variables both feed the same triple (as above), and that triple's subject isn't otherwise constrained elsewhere in the query, issue the relation lookup as two separate identical `SERVICE` calls, one per output variable** (see `exemplars.ttl`'s CQ4/CQ6 for worked examples) — binding both from a single `SERVICE` result into one unconstrained-subject triple was found to make QLever's query planner choose a catastrophic plan (multi-GB allocation attempt or 60+ second hang). The second identical call is cheap: successful relation resolutions are cached by phrase, so it's a near-instant repeat lookup, not a second LLM round trip. (CQ1 hits a related but distinct hazard on an *already*-constrained subject — see the next warning below and CQ1's own comment for why a subquery, not a call-split, is the fix there.)
 
 ```sparql
 SELECT ?person ?personLabel WHERE {
@@ -210,13 +210,7 @@ qlever start    # runs on port 7001
 qlever stop     # stop when done
 ```
 
-`wikidata-truthy/Qleverfile`'s `[server]` section sets `WARMUP_CMD` to apply the `cache-service-results=true` runtime parameter automatically on every `qlever start` — this is required for the multi-variable SERVICE joins described above to run in milliseconds instead of 90+ seconds (it tells QLever it may treat SERVICE results as stable/cacheable, which skips a query-planner hazard where it otherwise eagerly tries to materialize the *other* side of the join to check if it's small enough to push down, and that eager check itself scans nearly the entire graph when the other side is a fully-unbound triple pattern). Note this does **not** by itself prevent the 2+-SERVICE-bound-predicate-triple hazard described above — that needs the subquery-isolation fix, not just this flag. If you ever see multi-variable SERVICE joins go slow again, check it's still applied:
-
-```bash
-curl -s "http://localhost:7001/?cmd=get-settings&access-token=wikidata-truthy" | grep cache-service-results
-```
-
-Separately, QLever's general result cache (`CACHE_MAX_SIZE` in the same `[server]` section) caches *any* HTTP-200 SERVICE response, success or empty alike, keyed on the literal query text — this is why property-search surfaces resolution failures as non-2xx responses rather than empty-but-200 ones (see the tier-3 paragraph above): only a non-2xx response is guaranteed to be retried fresh instead of replaying a stale cached miss.
+QLever's general result cache (`CACHE_MAX_SIZE` in the same `[server]` section) caches *any* HTTP-200 SERVICE response, success or empty alike, keyed on the literal query text — this is why property-search surfaces resolution failures as non-2xx responses rather than empty-but-200 ones (see the tier-3 paragraph above): only a non-2xx response is guaranteed to be retried fresh instead of replaying a stale cached miss.
 
 ### SPARQL API (HTTP)
 
