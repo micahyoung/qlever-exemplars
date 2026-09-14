@@ -181,6 +181,10 @@ SELECT ?person ?personLabel WHERE {
 
 ⚠️ **A second, distinct hazard: a SERVICE-bound-predicate triple whose object joins into a plain (non-SERVICE-bound) triple** — e.g. resolving a property, then looking up the resolved object's `rdfs:label` — **can make QLever plan it as a full-dataset unbound-predicate scan**, deferring the known predicate-equality filter until after joining against the other large scan. Not specific to `OPTIONAL`. Fix: isolate the SERVICE-bound-predicate triple alone in its own subquery: `{ SELECT ?var1 ?var2 WHERE { SERVICE {...} ; ?var1 ?resolvedProp ?var2 . } }`. See `exemplars.ttl`'s CQ9. Not universal — a triple whose only downstream constraint is a range/numeric `FILTER` (not another join) doesn't benefit; see CQ3.
 
+⚠️ **A third hazard: a SERVICE-bound-predicate triple used inside `FILTER NOT EXISTS`/`MINUS`, or inside a `UNION` over both subject/object direction (for a symmetric relation like spouse), triggers the same unbound-predicate-object scan — and CQ9's subquery-isolation fix does NOT help here.** Isolation only helps when the isolated triple feeds a further *join*; when it's instead the operand of a set-difference or one branch of a direction-`UNION`, QLever still can't defer choosing an index-scan pattern until the SERVICE result materializes (confirmed: both forms hit a 65 GB allocation attempt / 30s timeout even fully isolated). No safe single-query SERVICE composition is known for either shape. Fix: resolve the property via a separate SERVICE call first, then hardcode the returned IRI into the negation/`UNION` clause of a second query. See `exemplars.ttl`'s CQ10 (negation) and CQ11 (symmetric relation).
+
+⚠️ **A fourth hazard, more severe than the first: two *different* `mwapi:searchRelation` pairs, each individually split into per-variable calls per the first hazard's fix, still time out if their triples are joined only by a shared unconstrained subject** (e.g. "people who received both award X and award Y" — two independent relation lookups joined on `?person`). The per-variable split only helps within one relation's own two output variables, not across two unrelated relations sharing a subject; confirmed this still produces a 30s timeout ("Join on ?awardProp") even with both relations split. Fix: don't resolve either side as a joint property+item pair — resolve the *shared* property once via plain `mwapi:search`/`mwapi:bind`, and resolve each item via a direct `rdfs:label` exact-match instead of `mwapi:searchRelation`. See `exemplars.ttl`'s CQ12.
+
 **Vocabulary:**
 
 | Input | Meaning |
@@ -229,7 +233,7 @@ query planner — see the multi-variable SERVICE join note above) fails fast ins
 grinding for minutes and burning the shared memory/cache budget.
 
 Override per-request with the `timeout` URL parameter — always allowed to go *lower* than
-the server default with no auth, but going *higher* requires `access_token`:
+the server default with no auth, but going *higher* requires `access-token`:
 
 ```bash
 # lower — no access token needed
@@ -237,7 +241,7 @@ curl -s localhost:7001 --data-urlencode 'query=...' --data-urlencode 'timeout=5s
 
 # higher — needs the access token
 curl -s localhost:7001 --data-urlencode 'query=...' \
-  --data-urlencode 'timeout=90s' --data-urlencode 'access_token=wikidata-truthy'
+  --data-urlencode 'timeout=90s' --data-urlencode 'access-token=wikidata-truthy'
 ```
 
 This matters for composed queries that rely on the property-search SERVICE's tier-3

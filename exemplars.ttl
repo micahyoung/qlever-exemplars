@@ -476,3 +476,146 @@ SELECT ?item ?label ?birth ?deathPlaceLabel WHERE {
   FILTER(LANG(?label) = "en")
 }
 """ .
+
+#################################################################
+# CQ10 — Negation (absence of a fact)
+#
+# None of CQ1-9 filter on the ABSENCE of a triple -- every existing filter
+# constrains on presence, or a numeric/date range. Wikidata models "first
+# ascent" not as a dedicated property but as a qualified wdt:P793
+# ("significant event") value of wd:Q1194369 ("first ascent") -- a
+# property+item PAIR, not a single obvious predicate. (A plausible-looking
+# wdt:P1249 is a red herring: it means "time of earliest written record"
+# and has zero matches on any Bhutanese mountain -- verify what a property
+# actually means before trusting its name.)
+#
+# The SERVICE-resolved variant is NOT viable: resolving "significant
+# event"/"first ascent" via mwapi:searchRelation and using the resulting
+# property+item pair inside FILTER NOT EXISTS (or MINUS, even isolated
+# into its own subquery exactly as CQ9 prescribes) both trigger the
+# unbound-predicate-object hazard at full scale (confirmed: a 65 GB
+# allocation attempt). CQ9's subquery-isolation fix only helps when the
+# isolated SERVICE-bound triple feeds a further JOIN -- it does not help
+# when that triple is instead the operand of a set-difference (NOT
+# EXISTS/MINUS). No safe single-query SERVICE composition is known for
+# this shape; if the predicate needs dynamic resolution, resolve it via a
+# separate SERVICE call first and hardcode the returned property/item IRIs
+# into the negation clause of a second query.
+#################################################################
+
+ex:CQ10 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ10 - Negation (absence of a fact)" ;
+    unit:testsOntology ex:WikidataTruthyDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "Which mountains in Bhutan have no recorded first ascent?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+
+SELECT ?item ?label WHERE {
+  ?item wdt:P31 wd:Q8502 ;
+        wdt:P17 wd:Q917 ;
+        rdfs:label ?label .
+  FILTER(LANG(?label) = "en")
+  FILTER NOT EXISTS { ?item wdt:P793 wd:Q1194369 }
+}
+""" .
+
+#################################################################
+# CQ11 — Symmetric relation stored in only one direction
+#
+# Wikidata does not always store a symmetric relation (e.g. wdt:P26,
+# spouse) as a pair of reciprocal triples -- many pairs are recorded in
+# only ONE direction. A query that assumes the resolved entity is always
+# the SUBJECT (as every prior exemplar does) silently returns zero results
+# for an entity that only appears as the OBJECT -- not an error, just a
+# wrong/incomplete answer. The fix is a UNION over both directions, not a
+# single hardcoded direction.
+#
+# The SERVICE-resolved variant is NOT viable: resolving "spouse" via
+# SERVICE and using the resulting variable predicate inside a two-
+# direction UNION triggers the same unbound-predicate-object hazard as
+# CQ9/CQ10, even when the whole SERVICE+UNION cluster is isolated into its
+# own subquery per CQ9's fix (confirmed: still hits the 30s timeout). As
+# with CQ10, no safe single-query SERVICE composition is known for this
+# shape; resolve the property via a separate SERVICE call first and
+# hardcode the returned IRI into the UNION.
+#################################################################
+
+ex:CQ11 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ11 - Symmetric relation stored in only one direction" ;
+    unit:testsOntology ex:WikidataTruthyDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "Who is Cecilia Ștefănescu's spouse?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+
+SELECT ?spouseLabel WHERE {
+  ?item rdfs:label "Cecilia Ștefănescu"@en .
+  { ?item wdt:P26 ?spouse } UNION { ?spouse wdt:P26 ?item }
+  ?spouse rdfs:label ?spouseLabel . FILTER(LANG(?spouseLabel) = "en")
+}
+""" .
+
+#################################################################
+# CQ12 — Two independent relation pairs joined on a shared subject
+#
+# CQ4/CQ6 already document that a single mwapi:searchRelation pair whose
+# two output variables both feed one unconstrained-subject triple must be
+# split into two identical per-variable SERVICE calls. This is a
+# different, MORE SEVERE hazard: two DIFFERENT relation pairs (different
+# phrases, different properties/items), each individually split per the
+# CQ4/CQ6 fix, then joined only by sharing the same unconstrained ?person
+# variable across both triples. Confirmed: this still triggers a 30s
+# timeout ("Join on ?awardProp") even after applying the per-variable
+# split to both relations -- that fix only helps within a single
+# relation's own two output variables, not across two unrelated relations
+# sharing a subject.
+#
+# Fix: don't resolve either award as a joint property+item pair at all.
+# Resolve the shared property ("award received") ONCE via a plain
+# mwapi:search/mwapi:bind, and resolve each award ITEM via a direct
+# rdfs:label exact-match instead of mwapi:searchRelation -- both awards
+# are already well-known named entities, so nothing is lost by skipping
+# the joint-context verification that searchRelation exists for. This
+# avoids ever having two distinct SERVICE-bound variable predicates in
+# play at once.
+#################################################################
+
+ex:CQ12 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ12 - Two independent relation pairs sharing a subject" ;
+    unit:testsOntology ex:WikidataTruthyDataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "Which people have received both the Copley Medal and the Nobel Prize in Chemistry?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+
+SELECT ?person ?personLabel WHERE {
+  ?person wdt:P166 wd:Q28003 .
+  ?person wdt:P166 wd:Q44585 .
+  ?person rdfs:label ?personLabel . FILTER(LANG(?personLabel) = "en")
+} ORDER BY ?personLabel
+""" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+
+SELECT ?person ?personLabel WHERE {
+  # Single shared-property resolution, NOT two mwapi:searchRelation calls --
+  # see the header comment above for why two joint property+item
+  # resolutions sharing a subject is a worse hazard than either CQ4/CQ6's
+  # single-relation case or CQ9's single-object case.
+  SERVICE <http://localhost:7002/sparql> {
+    [] mwapi:search "award received" ; mwapi:type "property" ; mwapi:bind ?awardProp .
+  }
+  ?copleyMedal rdfs:label "Copley Medal"@en .
+  ?nobelChemistry rdfs:label "Nobel Prize in Chemistry"@en .
+  ?person ?awardProp ?copleyMedal .
+  ?person ?awardProp ?nobelChemistry .
+  ?person rdfs:label ?personLabel . FILTER(LANG(?personLabel) = "en")
+} ORDER BY ?personLabel
+""" .
