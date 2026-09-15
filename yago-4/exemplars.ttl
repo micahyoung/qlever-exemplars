@@ -1,0 +1,411 @@
+@prefix unit:  <https://w3id.org/OWLunit/ontology/> .
+@prefix ex:    <https://example.org/qlever/yago-4/cq/> .
+@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:   <http://www.w3.org/2002/07/owl#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+
+#################################################################
+# Ontology / dataset under test
+#
+# This file mirrors ../wikidata-truthy/exemplars.ttl (the Wikidata-truthy exemplars) but
+# targets YAGO-4 (localhost:9004) directly -- no SERVICE, no property-search
+# resolver, just YAGO's own schema.org + yago-knowledge.org vocabulary.
+#
+# CQ numbers are REUSED from ../wikidata-truthy/exemplars.ttl on purpose, to make it easy to
+# line up "the same competency question, answered against a different KG."
+# Only CQs verified to produce the SAME real-world answer (checked against a
+# live run of the original hardcoded query on localhost:7001) are included
+# here. See "EXCLUDED CQs" at the bottom for the ones that don't port.
+#################################################################
+
+ex:Yago4Dataset a owl:Ontology ;
+    rdfs:label "YAGO 4.6 (QLever local endpoint)" .
+
+#################################################################
+# CQ1 — Entity attribute lookup
+#
+# Verified identical to Wikidata: birth=1867-11-07, death=1934-07-04.
+# The canonical resource is the bare-name URI (no "_Q..." suffix) --
+# confirmed by checking it carries schema:award (Nobel Chemistry/Physics)
+# etc., not just by URI shape. A production query would still resolve via
+# rdfs:label "Marie Curie"@en and disambiguate by presence of birthDate,
+# since several "Marie_Curie_Q..." stub variants also match the label.
+#################################################################
+
+ex:CQ1 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ1 - Entity attribute lookup" ;
+    unit:testsOntology ex:Yago4Dataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "When was Marie Curie born, and what was her date of death?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX schema: <http://schema.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX yago: <http://yago-knowledge.org/resource/>
+
+SELECT ?item ?label ?birth ?death WHERE {
+  ?item rdfs:label "Marie Curie"@en ;
+        schema:birthDate ?birth ;
+        rdfs:label ?label .
+  OPTIONAL { ?item schema:deathDate ?death }
+  FILTER(LANG(?label) = "en")
+  # Disambiguate against "Marie_Curie_Q..." stub variants sharing the label:
+  # only the canonical resource has a birthDate.
+}
+""" .
+
+#################################################################
+# CQ2 — Relationship / hierarchy traversal
+#
+# YAGO has no property-path equivalent of Wikidata's wdt:P131+ (nor would
+# one be needed: schema:location is already stored flat across multiple
+# hierarchy hops on each entity, e.g. Gweru itself has both
+# schema:location Midlands_Province AND schema:location Zimbabwe as
+# separate direct triples). Querying "?item schema:location ?gweru" (the
+# reverse direction from Wikidata's traversal) returns entities located IN
+# Gweru rather than Gweru's own ancestor chain -- the closer analog of the
+# original CQ's intent ("what falls under Gweru's hierarchy").
+#
+# Result overlaps only partially with the Wikidata answer (2 of 4 entities
+# match; YAGO splits "Midlands State University" into separate per-faculty
+# resources instead of one university entity, includes a notable person
+# born there, and is missing the hospital) -- a genuine KG-coverage/
+# granularity difference, not a query-correctness problem. Included as a
+# practical-equivalence case: both queries correctly enumerate real things
+# located in/under Gweru.
+#################################################################
+
+ex:CQ2 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ2 - Hierarchy traversal (practical equivalence, partial overlap)" ;
+    unit:testsOntology ex:Yago4Dataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "What entities fall under the administrative/locational hierarchy of Gweru, Zimbabwe?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX schema: <http://schema.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?item ?label WHERE {
+  ?gweru rdfs:label "Gweru"@en .
+  ?item schema:location ?gweru .
+  ?item rdfs:label ?label . FILTER(LANG(?label)="en")
+}
+""" .
+
+#################################################################
+# CQ3 — Multi-hop join with entity-type disambiguation
+#
+# Verified IDENTICAL to Wikidata: exactly Frankfurt (775790/founded 100),
+# Dortmund (595471/882), Munich (1510378/1158), same population and
+# founding-year values as the Wikidata-truthy answer.
+#
+# YAGO reuses yago:populationNumber and schema:startDate on Catholic
+# diocese/archdiocese resources (for "number of Catholics" and "diocese
+# founding year" respectively), and those resources also carry
+# schema:location Germany -- so the naive analog of Wikidata's
+# wdt:P31/wdt:P279* wd:Q515 type filter (which YAGO has no equivalent of)
+# initially looked unfixable: no unifying "City" rdf:type exists to filter
+# TO, and a `FILTER(CONTAINS(STR(?t), "Diocese"))`-style filter to filter
+# AWAY from is itself the CONTAINS-on-unindexed-scan hazard (confirmed:
+# forces a full 23.5M-triple rdf:type scan, times out at 30s).
+#
+# Fix: the false positives all resolve to exactly TWO distinct rdf:type
+# IRIs (yago:Diocese_Of_The_Catholic_Church, yago:Roman_Catholic_
+# Metropolitan_Archdiocese) -- confirmed by checking rdf:type on all 11
+# false-positive rows from the unfiltered query. Excluding those two exact
+# IRIs via FILTER NOT EXISTS (equality against a known small IRI, not a
+# string scan) runs in under 100ms and returns precisely the 3 correct
+# cities. This works only because the false-positive class here is a
+# single, small, enumerable set of exact types -- contrast with CQ6 below,
+# where the equivalent fix is NOT available.
+#################################################################
+
+ex:CQ3 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ3 - Multi-hop join with entity-type disambiguation" ;
+    unit:testsOntology ex:Yago4Dataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "Which cities in Germany have a population over 500,000 and were founded before the year 1200?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX schema: <http://schema.org/>
+PREFIX yago: <http://yago-knowledge.org/resource/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT ?city ?label ?pop ?start WHERE {
+  ?city schema:location yago:Germany .
+  ?city yago:populationNumber ?pop .
+  ?city schema:startDate ?start .
+  FILTER(?pop > 500000)
+  FILTER(xsd:integer(SUBSTR(STR(?start),1,4)) < 1200)
+  # Exact-IRI exclusion, NOT a CONTAINS string scan -- see header comment.
+  FILTER NOT EXISTS { ?city a yago:Diocese_Of_The_Catholic_Church }
+  FILTER NOT EXISTS { ?city a yago:Roman_Catholic_Metropolitan_Archdiocese }
+  ?city rdfs:label ?label . FILTER(LANG(?label)="en")
+} ORDER BY ?start
+""" .
+
+#################################################################
+# CQ4 — Aggregation / ranking
+#
+# Verified practically equivalent: counts for the top 9 countries are
+# IDENTICAL to Wikidata (US 112, UK 31, Germany 25, France 19, Soviet Union
+# 13, Japan 12, Netherlands 10, Switzerland 9, Canada 7). The 10th-place
+# entries differ only in which historical political entity YAGO/Wikidata
+# picked as the nationality label at count=6 (Wikidata: "Russian Empire";
+# YAGO: "United Kingdom of Great Britain and Ireland") -- a tie broken
+# differently, not a data discrepancy in the underlying facts.
+#
+# schema:award linking directly to Nobel_Prize_in_Physics as a flat object
+# (same pattern as Wikidata's wdt:P166/wd:Q38104) means no relation-pair
+# resolution is needed at all here, unlike the SERVICE-resolved Wikidata
+# variant in ../wikidata-truthy/exemplars.ttl.
+#################################################################
+
+ex:CQ4 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ4 - Aggregation and ranking" ;
+    unit:testsOntology ex:Yago4Dataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "Which countries have produced the most Nobel Prize laureates in Physics, ranked from most to least?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX schema: <http://schema.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX yago: <http://yago-knowledge.org/resource/>
+
+SELECT ?countryLabel (COUNT(DISTINCT ?person) AS ?count) WHERE {
+  ?person schema:award yago:Nobel_Prize_in_Physics .
+  ?person schema:nationality ?country .
+  ?country rdfs:label ?countryLabel . FILTER(LANG(?countryLabel)="en")
+} GROUP BY ?countryLabel ORDER BY DESC(?count) LIMIT 10
+""" .
+
+#################################################################
+# CQ5 — Disambiguation via type/context constraints
+#
+# Verified IDENTICAL population value to Wikidata: 114,394.
+#
+# Unlike Wikidata, a bare rdfs:label "Springfield"@en does NOT resolve to
+# the Illinois capital (it resolves to a Springfield in Spain, and none of
+# the 81 label-matched "Springfield" candidates has an Illinois-hierarchy
+# schema:location) -- YAGO's English label for this entity already bakes
+# in the "City, State" disambiguator: "Springfield, Illinois"@en. So the
+# Wikidata pattern of "bare label + P131* hierarchy filter" doesn't
+# transfer; the exact-match label itself does the disambiguation here.
+#################################################################
+
+ex:CQ5 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ5 - Disambiguation via context constraint" ;
+    unit:testsOntology ex:Yago4Dataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "What is the population of Springfield, Illinois?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX yago: <http://yago-knowledge.org/resource/>
+
+SELECT ?item ?pop WHERE {
+  ?item rdfs:label "Springfield, Illinois"@en .
+  ?item yago:populationNumber ?pop .
+}
+""" .
+
+#################################################################
+# CQ7 — Bounded-depth hierarchy traversal, fully dynamic
+#
+# Verified IDENTICAL to Wikidata: regionLabel="Midlands Province",
+# countryLabel="Zimbabwe".
+#
+# No property-path modifier issue to sidestep here (YAGO never supported
+# one for this anyway) -- but schema:location on Gweru is itself
+# multi-valued and flat across hierarchy levels PLUS continental/political-
+# bloc groupings (Gweru -> Zimbabwe directly, and Gweru -> Midlands_Province
+# -> {Zimbabwe, Africa, African Union, East Africa, Southern Africa} all as
+# sibling triples). The FILTER excluding "Zimbabwe" as a ?region value is
+# required to avoid picking the direct Gweru->Zimbabwe edge instead of the
+# intended two-hop province->country chain.
+#################################################################
+
+ex:CQ7 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ7 - Bounded-depth hierarchy traversal (dynamic CQ2 variant)" ;
+    unit:testsOntology ex:Yago4Dataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "What are Gweru, Zimbabwe's parent administrative region and that region's parent country?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX schema: <http://schema.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?regionLabel ?countryLabel WHERE {
+  ?gweru rdfs:label "Gweru"@en .
+  ?gweru schema:location ?region .
+  ?region schema:location ?country .
+  ?region rdfs:label ?regionLabel . FILTER(LANG(?regionLabel)="en")
+  ?country rdfs:label ?countryLabel . FILTER(LANG(?countryLabel)="en")
+  FILTER(?regionLabel != "Zimbabwe"@en)
+}
+""" .
+
+#################################################################
+# CQ8 — Disambiguation via single-hop relation, fully dynamic
+#
+# Verified IDENTICAL population value to Wikidata: 114,394.
+#
+# Unlike Wikidata's "Illinois"@en (which resolves cleanly), YAGO's bare
+# rdfs:label "Illinois"@en doesn't match the state at all -- only
+# "Illinois_Q..." disambiguation stubs exist (one of which is even a New
+# Mexico mine, confirming "bare URI/label = the real entity" doesn't hold
+# in this KG the way it sometimes does for people). The real state's
+# English label is "State of Illinois"@en. Once that's used, yago:capital
+# picks out Springfield unambiguously (a single row, no join-based
+# disambiguation needed).
+#################################################################
+
+ex:CQ8 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ8 - Disambiguation via single-hop relation (dynamic CQ5 variant)" ;
+    unit:testsOntology ex:Yago4Dataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "What is the population of the Springfield that is the capital of Illinois?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX yago: <http://yago-knowledge.org/resource/>
+
+SELECT ?item ?label ?pop WHERE {
+  ?illinois rdfs:label "State of Illinois"@en .
+  ?illinois yago:capital ?item .
+  ?item yago:populationNumber ?pop .
+  ?item rdfs:label ?label . FILTER(LANG(?label)="en")
+}
+""" .
+
+#################################################################
+# CQ9 — Entity attribute + related-entity label lookup
+#
+# Verified IDENTICAL to Wikidata: birth=1878-11-01, deathPlaceLabel=
+# "Cambridge". No SERVICE layer exists in this file, so the original CQ9's
+# subquery-isolation hazard (a SERVICE-bound predicate's object feeding a
+# further plain join) is moot here -- this is a pure local join with
+# hardcoded predicates throughout, nothing for a query planner to
+# mis-order.
+#################################################################
+
+ex:CQ9 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ9 - Entity attribute + related-entity label lookup" ;
+    unit:testsOntology ex:Yago4Dataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "When was Lise Meitner born, and where did she die?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX schema: <http://schema.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?item ?label ?birth ?deathPlaceLabel WHERE {
+  ?item rdfs:label "Lise Meitner"@en ;
+        schema:birthDate ?birth ;
+        rdfs:label ?label .
+  OPTIONAL {
+    ?item schema:deathPlace ?deathPlace .
+    ?deathPlace rdfs:label ?deathPlaceLabel . FILTER(LANG(?deathPlaceLabel)="en")
+  }
+  FILTER(LANG(?label) = "en")
+}
+""" .
+
+#################################################################
+# CQ12 — Cross-domain conjunction via a shared subject
+#
+# Verified practically equivalent: all 20 people in the Wikidata answer
+# are present in YAGO's 21-row result. The one extra name (Alexander R.
+# Todd, Baron Todd) is a genuine real-world dual Copley Medal (1972) +
+# Nobel Prize in Chemistry (1957) laureate that the Wikidata-truthy dataset
+# happens to be missing a P166 statement for -- i.e. YAGO is more complete
+# here, not wrong.
+#
+# schema:award links directly to both award entities as flat objects (same
+# pattern as CQ4), so -- as in the original Wikidata SERVICE-resolved
+# variant's own header comment -- no relation-pair resolution machinery is
+# needed; this is actually simpler here than the CQ4/CQ6-style hazards it
+# analogizes to when SERVICE is involved.
+#################################################################
+
+ex:CQ12 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ12 - Two independent awards sharing a subject" ;
+    unit:testsOntology ex:Yago4Dataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "Which people have received both the Copley Medal and the Nobel Prize in Chemistry?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX schema: <http://schema.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?person ?personLabel WHERE {
+  ?copleyMedal rdfs:label "Copley Medal"@en .
+  ?nobelChem rdfs:label "Nobel Prize in Chemistry"@en .
+  ?person schema:award ?copleyMedal .
+  ?person schema:award ?nobelChem .
+  ?person rdfs:label ?personLabel . FILTER(LANG(?personLabel) = "en")
+} ORDER BY ?personLabel
+""" .
+
+#################################################################
+# CQ11 — Symmetric relation stored in only one direction
+#
+# Verified IDENTICAL to Wikidata: spouse = Florin Iaru.
+#
+# A prior pass at this file wrongly concluded Cecilia Ștefănescu has no
+# schema:spouse data in YAGO at all and substituted a different person.
+# That was wrong: the data exists, just stored in the OPPOSITE direction
+# from what a naive query assumes -- confirmed live: `?item schema:spouse
+# ?spouse` (item = Cecilia) returns ZERO rows, while `?spouse schema:spouse
+# ?item` returns exactly "Florin Iaru", matching the real-world fact (and
+# Wikidata's own answer) exactly. This is precisely the phenomenon CQ11
+# exists to test, reproduced with the original named person -- the lesson
+# is the same as Wikidata's: schema:spouse is not guaranteed to be stored
+# as a reciprocal pair, so a query that assumes the resolved entity is
+# always the subject silently returns an empty (not error) result for
+# entities that only appear as the object.
+#################################################################
+
+ex:CQ11 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ11 - Symmetric relation stored in only one direction" ;
+    unit:testsOntology ex:Yago4Dataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "Who is Cecilia Ștefănescu's spouse?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX schema: <http://schema.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?spouseLabel WHERE {
+  ?item rdfs:label "Cecilia Ștefănescu"@en .
+  { ?item schema:spouse ?spouse } UNION { ?spouse schema:spouse ?item }
+  ?spouse rdfs:label ?spouseLabel . FILTER(LANG(?spouseLabel) = "en")
+}
+""" .
+
+#################################################################
+# EXCLUDED CQs — verified NOT to produce the same real-world answer
+#
+# CQ6 (breweries in national capitals founded before 1900): yago:Brewery
+# and yago:capital both exist and individually work, but yago:capital also
+# links administrative districts (e.g. Rhein-Neckar-Kreis, a Baden-
+# Württemberg rural district; type Rural_District_Of_Baden-Württemberg) and
+# historical polities (e.g. Electoral_Palatinate; types County_palatine /
+# Electoral_Principate / State_In_The_Holy_Roman_Empire) to their seats,
+# and there is no clean Country/Sovereign_state rdf:type to filter those
+# out (Germany's own rdf:type values are things like
+# Country_Bordering_The_Baltic_Sea / Rechtsstaat; France's are
+# Colonial_Power / Mediterranean_Country -- no shared "is a country"
+# class). Unlike CQ3, the false-positive sources here are NOT a small
+# enumerable set of exact types -- confirmed live: a
+# `FILTER EXISTS { ?p schema:nationality ?country }` heuristic (only keep
+# "capitals" of countries with citizens) still leaks Heidelberg, Karlsruhe,
+# Sigmaringen, and Lyon (all schema:nationality-bearing entities in their
+# own right via historical/regional associations). No exact-IRI exclusion
+# closes this the way it did for CQ3's two diocese types, so the answer
+# set remains an unbounded superset of the true one.
+#
+# CQ10 (Bhutanese mountains with no recorded first ascent): confirmed NOT
+# MODELED, checked two ways. (1) Per-entity: the full predicate list of
+# multiple Bhutanese mountains (including ones that HAVE been climbed,
+# e.g. Kula_Kangri) carries only alternateName/geo/image/location/sameAs/
+# url/type/comment/label/elevation/siteLinks. (2) Schema-wide: pulled the
+# canonical list of all 156 properties YAGO defines (via `?shape sh:path
+# ?path` against the indexed schema file) and grepped it for
+# ascent/climb/summit/first -- zero matches. Nothing resembling Wikidata's
+# wdt:P793/wd:Q1194369 ("significant event" = "first ascent") qualified-
+# statement pattern exists anywhere in the schema. No query, with or
+# without modification, can answer this.
+#################################################################

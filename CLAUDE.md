@@ -46,7 +46,7 @@ rm -f wikidata-truthy.* wikidata-truthy.internal.index.*
 ## Querying
 
 **SERVICE is the default for resolving predicates from natural language.**
-Never probe predicate frequencies to discover properties — SERVICE handles exact matches (pinned first, and preferred over any looser alias match — see below) for `mwapi:type "property"`. See `hazards.ttl` (Hazard 7) for the confirmed pathological form (full ~8.2B-triple scan, 30s timeout) and its query plan.
+Never probe predicate frequencies to discover properties — SERVICE handles exact matches (pinned first, and preferred over any looser alias match — see below) for `mwapi:type "property"`. See `wikidata-truthy/hazards.ttl` (Hazard 7) for the confirmed pathological form (full ~8.2B-triple scan, 30s timeout) and its query plan.
 
 **SERVICE can attempt general entity resolution, but it's best-effort.** `mwapi:type "item"` indexes the ~114k entities that appear as the object of a `P31` ("instance of") triple somewhere in the dataset — i.e. class/type entities like `Q5` (human) or `Q515` (city) — and resolves those instantly. For everything else (e.g. "Marie Curie", "the Big Apple"), it falls back to a tier-3 resolver: an LLM proposes candidate canonical names, each is verified with a **live** exact-match query against QLever itself (not just the precomputed index), and same-labeled candidates are disambiguated by statement count. This is not guaranteed to resolve, and has LLM-round-trip latency (can be several seconds to tens of seconds) on a cache miss — successful resolutions are persisted, so a repeat query for the same phrase becomes an instant exact-match hit.
 
@@ -61,7 +61,7 @@ SELECT ?item ?label WHERE {
 } LIMIT 10
 ```
 
-Never use `FILTER(CONTAINS(?label, "..."))` (or any other unanchored label scan) — it forces a full unindexed scan over the label predicate and will time out, the same way an unconstrained variable-predicate scan does. Use the exact literal match above, then disambiguate candidates (there are often several) with a follow-up query constraining on `P31`/`P131` etc. See `hazards.ttl` (Hazard 5) for the confirmed pathological form and its query plan.
+Never use `FILTER(CONTAINS(?label, "..."))` (or any other unanchored label scan) — it forces a full unindexed scan over the label predicate and will time out, the same way an unconstrained variable-predicate scan does. Use the exact literal match above, then disambiguate candidates (there are often several) with a follow-up query constraining on `P31`/`P131` etc. See `wikidata-truthy/hazards.ttl` (Hazard 5) for the confirmed pathological form and its query plan.
 
 ### Step 1: Resolve
 
@@ -89,7 +89,7 @@ SELECT ?prop ?propLabel ?propScore ?entity ?entityLabel ?entityScore WHERE {
 
 ### Step 2: Compose
 
-Plug resolved P-id and Q-id into the final query. Use `*` (zero-or-more) on `P131` — administrative hierarchies are rarely flat. **Always constrain the subject** (a `VALUES` list or a `P31` type filter); an unconstrained variable-predicate scan can take 90+ seconds and crash QLever. See `hazards.ttl` (Hazard 6) for the confirmed pathological form and its query plan.
+Plug resolved P-id and Q-id into the final query. Use `*` (zero-or-more) on `P131` — administrative hierarchies are rarely flat. **Always constrain the subject** (a `VALUES` list or a `P31` type filter); an unconstrained variable-predicate scan can take 90+ seconds and crash QLever. See `wikidata-truthy/hazards.ttl` (Hazard 6) for the confirmed pathological form and its query plan.
 
 ```sparql
 PREFIX wd:  <http://www.wikidata.org/entity/>
@@ -160,7 +160,7 @@ SELECT ?person ?personLabel WHERE {
 }
 ```
 
-⚠️ **If a relation pair's two output variables both feed the same triple (as above), and that triple's subject isn't otherwise constrained elsewhere in the query, issue the relation lookup as two separate identical `SERVICE` calls, one per output variable** (see `exemplars.ttl`'s CQ4/CQ6 for worked examples) — binding both from a single `SERVICE` result into one unconstrained-subject triple makes QLever's planner choose a catastrophic plan (multi-GB allocation attempt or 60+ second hang). The second identical call is cheap: successful relation resolutions are cached by phrase, so it's a near-instant repeat lookup, not a second LLM round trip. See `hazards.ttl` (Hazard 1) for the confirmed pathological form and its query plan.
+⚠️ **If a relation pair's two output variables both feed the same triple (as above), and that triple's subject isn't otherwise constrained elsewhere in the query, issue the relation lookup as two separate identical `SERVICE` calls, one per output variable** (see `wikidata-truthy/exemplars.ttl`'s CQ4/CQ6 for worked examples) — binding both from a single `SERVICE` result into one unconstrained-subject triple makes QLever's planner choose a catastrophic plan (multi-GB allocation attempt or 60+ second hang). The second identical call is cheap: successful relation resolutions are cached by phrase, so it's a near-instant repeat lookup, not a second LLM round trip. See `wikidata-truthy/hazards.ttl` (Hazard 1) for the confirmed pathological form and its query plan.
 
 ```sparql
 SELECT ?person ?personLabel WHERE {
@@ -179,7 +179,7 @@ SELECT ?person ?personLabel WHERE {
 }
 ```
 
-⚠️ **Three more SERVICE-composition hazards are documented in `hazards.ttl`** (each as its own OWLunit exemplar, CQ text prefixed `[hazard]`, with the confirmed pathological query, inline comments explaining the failure, and the actual query plan/exception QLever returned): a SERVICE-bound-predicate triple whose object joins into a further plain triple without subquery isolation (Hazard 2 — fix: `exemplars.ttl` CQ9); `mwapi:searchRelation`'s joint property+item binding used inside `FILTER NOT EXISTS`/`MINUS` or a direction-`UNION`, which fails even fully subquery-isolated (Hazards 3a/3b — fix: `exemplars.ttl` CQ10/CQ11); and two independent, already-split relation pairs joined only by a shared unconstrained subject (Hazard 4 — fix: `exemplars.ttl` CQ12).
+⚠️ **Three more SERVICE-composition hazards are documented in `wikidata-truthy/hazards.ttl`** (each as its own OWLunit exemplar, CQ text prefixed `[hazard]`, with the confirmed pathological query, inline comments explaining the failure, and the actual query plan/exception QLever returned): a SERVICE-bound-predicate triple whose object joins into a further plain triple without subquery isolation (Hazard 2 — fix: `wikidata-truthy/exemplars.ttl` CQ9); `mwapi:searchRelation`'s joint property+item binding used inside `FILTER NOT EXISTS`/`MINUS` or a direction-`UNION`, which fails even fully subquery-isolated (Hazards 3a/3b — fix: `wikidata-truthy/exemplars.ttl` CQ10/CQ11); and two independent, already-split relation pairs joined only by a shared unconstrained subject (Hazard 4 — fix: `wikidata-truthy/exemplars.ttl` CQ12).
 
 **Vocabulary:**
 
