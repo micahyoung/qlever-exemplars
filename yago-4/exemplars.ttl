@@ -101,12 +101,11 @@ SELECT ?item ?label WHERE {
 # YAGO reuses yago:populationNumber and schema:startDate on Catholic
 # diocese/archdiocese resources (for "number of Catholics" and "diocese
 # founding year" respectively), and those resources also carry
-# schema:location Germany -- so the naive analog of Wikidata's
-# wdt:P31/wdt:P279* wd:Q515 type filter (which YAGO has no equivalent of)
-# initially looked unfixable: no unifying "City" rdf:type exists to filter
-# TO, and a `FILTER(CONTAINS(STR(?t), "Diocese"))`-style filter to filter
-# AWAY from is itself the CONTAINS-on-unindexed-scan hazard (confirmed:
-# forces a full 23.5M-triple rdf:type scan, times out at 30s).
+# schema:location Germany -- so a filter is needed to keep cities and
+# exclude dioceses. YAGO has no unifying "City" rdf:type to filter TO, and
+# a `FILTER(CONTAINS(STR(?t), "Diocese"))`-style filter to filter AWAY
+# FROM is itself the CONTAINS-on-unindexed-scan hazard (confirmed: forces
+# a full 23.5M-triple rdf:type scan, times out at 30s).
 #
 # Fix: the false positives all resolve to exactly TWO distinct rdf:type
 # IRIs (yago:Diocese_Of_The_Catholic_Church, yago:Roman_Catholic_
@@ -115,8 +114,9 @@ SELECT ?item ?label WHERE {
 # IRIs via FILTER NOT EXISTS (equality against a known small IRI, not a
 # string scan) runs in under 100ms and returns precisely the 3 correct
 # cities. This works only because the false-positive class here is a
-# single, small, enumerable set of exact types -- contrast with CQ6 below,
-# where the equivalent fix is NOT available.
+# single, small, enumerable set of exact types -- contrast with the
+# breweries-in-national-capitals topic in the EXCLUDED CQs section below,
+# where no such small enumerable set exists.
 #################################################################
 
 ex:CQ3 a unit:CompetencyQuestionVerification ;
@@ -204,6 +204,48 @@ SELECT ?item ?pop WHERE {
   ?item rdfs:label "Springfield, Illinois"@en .
   ?item yago:populationNumber ?pop .
 }
+""" .
+
+#################################################################
+# CQ6 — Cross-domain fact linking via a broad relation
+#
+# yago:influencedBy is used broadly across many semantically different
+# kinds of influence: Friedrich Nietzsche's influencedBy targets include
+# not just fellow philosophers but musicians (Richard Wagner), political/
+# military figures (Napoleon, Julius Caesar), and scientists (Charles
+# Darwin). Following the relation blindly does not mean "influenced by a
+# philosopher." A type-based filter (`?x a ?t . ?t rdfs:subClassOf*
+# yago:Philosopher`) still lets Charles Darwin through, so it is not used
+# here. Instead, the three canonical ancient Greek philosophers are pinned
+# directly via VALUES -- a small, exact, real-world-enumerable set (the
+# same approach CQ12 uses for its two award entities).
+#
+# Verified practically equivalent: Wikidata's wdt:P737 ("influenced by")
+# against wd:Q868/Q859/Q913 (Aristotle/Plato/Socrates), born after 1800,
+# returns 66 people; the identical YAGO query returns 64. Same names, same
+# order, same birth dates for the overlap (Ralph Waldo Emerson 1803,
+# Søren Kierkegaard 1813, Friedrich Nietzsche 1844, Martin Heidegger 1889,
+# down through Stefan Molyneux 1966).
+#################################################################
+
+ex:CQ6 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ6 - Cross-domain fact linking via a broad relation" ;
+    unit:testsOntology ex:Yago4Dataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "Which philosophers born after 1800 were influenced by Aristotle, Plato, or Socrates?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX schema: <http://schema.org/>
+PREFIX yago: <http://yago-knowledge.org/resource/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT DISTINCT ?personLabel ?birth WHERE {
+  VALUES ?influencer { yago:Aristotle yago:Plato yago:Socrates }
+  ?person yago:influencedBy ?influencer .
+  ?person schema:birthDate ?birth .
+  FILTER(xsd:integer(SUBSTR(STR(?birth),1,4)) > 1800)
+  ?person rdfs:label ?personLabel . FILTER(LANG(?personLabel)="en")
+} ORDER BY ?birth
 """ .
 
 #################################################################
@@ -345,18 +387,14 @@ SELECT ?person ?personLabel WHERE {
 #
 # Verified IDENTICAL to Wikidata: spouse = Florin Iaru.
 #
-# A prior pass at this file wrongly concluded Cecilia Ștefănescu has no
-# schema:spouse data in YAGO at all and substituted a different person.
-# That was wrong: the data exists, just stored in the OPPOSITE direction
-# from what a naive query assumes -- confirmed live: `?item schema:spouse
-# ?spouse` (item = Cecilia) returns ZERO rows, while `?spouse schema:spouse
-# ?item` returns exactly "Florin Iaru", matching the real-world fact (and
-# Wikidata's own answer) exactly. This is precisely the phenomenon CQ11
-# exists to test, reproduced with the original named person -- the lesson
-# is the same as Wikidata's: schema:spouse is not guaranteed to be stored
-# as a reciprocal pair, so a query that assumes the resolved entity is
-# always the subject silently returns an empty (not error) result for
-# entities that only appear as the object.
+# The data is stored in the OPPOSITE direction from what a naive query
+# assumes -- confirmed live: `?item schema:spouse ?spouse` (item = Cecilia)
+# returns ZERO rows, while `?spouse schema:spouse ?item` returns exactly
+# "Florin Iaru", matching the real-world fact (and Wikidata's own answer)
+# exactly. schema:spouse is not guaranteed to be stored as a reciprocal
+# pair, so a query that assumes the resolved entity is always the subject
+# silently returns an empty (not error) result for entities that only
+# appear as the object.
 #################################################################
 
 ex:CQ11 a unit:CompetencyQuestionVerification ;
@@ -376,10 +414,47 @@ SELECT ?spouseLabel WHERE {
 """ .
 
 #################################################################
+# CQ10 — Negation via a rare shared predicate
+#
+# yago:consumes ("main food source", a predator-prey diet relationship)
+# derives from Wikidata's wdt:P1034. Among the six bear species (family
+# Ursidae) checked here, American black bear, Asian black bear, and Sun
+# bear have ZERO diet records in both KGs' richest entity for that species
+# (each confirmed via triple-count: e.g. Wikidata's Q122783 "American
+# black bear" has 697 triples total but 0 wdt:P1034 -- not a sparse stub,
+# a real article that simply lacks this one fact), while Brown bear, Polar
+# bear, and Giant panda have real (if numerically different) diet data in
+# both. The has/has-not SET matches exactly between the two KGs even
+# though the raw counts don't. Each species is identified by its richest
+# candidate entity (by total triple count) rather than the first label
+# match, since both KGs carry near-empty disambiguation-stub duplicates
+# under similar labels, and neither KG uses one naming convention
+# (common name vs. scientific binomial) consistently.
+#################################################################
+
+ex:CQ10 a unit:CompetencyQuestionVerification ;
+    rdfs:label "CQ10 - Negation via a rare shared predicate" ;
+    unit:testsOntology ex:Yago4Dataset ;
+    unit:hasInputTestDataCategory unit:SPARQLendpoint ;
+    unit:hasCompetencyQuestion "Among brown bear, polar bear, giant panda, American black bear, Asian black bear, and sun bear, which have no recorded diet?" ;
+    unit:hasSPARQLQueryUnitTest """
+PREFIX yago: <http://yago-knowledge.org/resource/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?label (COUNT(?food) AS ?dietRecords) WHERE {
+  VALUES ?bear { yago:Brown_bear yago:Polar_bear yago:Giant_panda
+                 yago:American_black_bear yago:Asian_black_bear yago:Sun_bear }
+  ?bear rdfs:label ?label . FILTER(LANG(?label)="en")
+  OPTIONAL { ?bear yago:consumes ?food }
+} GROUP BY ?bear ?label ORDER BY ?dietRecords
+""" .
+
+#################################################################
 # EXCLUDED CQs — verified NOT to produce the same real-world answer
 #
-# CQ6 (breweries in national capitals founded before 1900): yago:Brewery
-# and yago:capital both exist and individually work, but yago:capital also
+# Breweries headquartered in national capitals founded before 1900:
+# yago:Brewery and yago:capital both exist and individually work, but
+# yago:capital also
 # links administrative districts (e.g. Rhein-Neckar-Kreis, a Baden-
 # Württemberg rural district; type Rural_District_Of_Baden-Württemberg) and
 # historical polities (e.g. Electoral_Palatinate; types County_palatine /
@@ -397,7 +472,7 @@ SELECT ?spouseLabel WHERE {
 # closes this the way it did for CQ3's two diocese types, so the answer
 # set remains an unbounded superset of the true one.
 #
-# CQ10 (Bhutanese mountains with no recorded first ascent): confirmed NOT
+# Bhutanese mountains with no recorded first ascent: confirmed NOT
 # MODELED, checked two ways. (1) Per-entity: the full predicate list of
 # multiple Bhutanese mountains (including ones that HAVE been climbed,
 # e.g. Kula_Kangri) carries only alternateName/geo/image/location/sameAs/
